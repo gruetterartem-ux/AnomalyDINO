@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 import os
 
+IMAGE_EXTENSIONS = ('.png', '.PNG', '.jpg', '.JPG', '.jpeg', '.JPEG',
+                    '.bmp', '.BMP', '.tif', '.TIF', '.tiff', '.TIFF')
+
 def augment_image(img_ref, augmentation = "rotate", angles = [0, 45, 90, 135, 180, 225, 270, 315]):
     """
     Simply augmentation of images, currently just rotation.
@@ -37,6 +40,30 @@ def resize_mask_img(mask, image_shape, grid_size1):
     mask = np.repeat(mask, imgd1, axis=0)
     mask = np.repeat(mask, imgd2, axis=1)
     return mask
+
+
+def is_image_file(filename):
+    return os.path.splitext(filename)[1] in IMAGE_EXTENSIONS
+
+
+def list_image_files(directory, recursive=False):
+    if not os.path.isdir(directory):
+        return []
+
+    if not recursive:
+        return sorted([filename for filename in os.listdir(directory)
+                       if is_image_file(filename)])
+
+    image_files = []
+    for root, _, filenames in os.walk(directory):
+        rel_root = os.path.relpath(root, directory)
+        for filename in filenames:
+            if not is_image_file(filename):
+                continue
+            rel_path = filename if rel_root == "." else os.path.join(rel_root, filename)
+            image_files.append(rel_path.replace("\\", "/"))
+
+    return sorted(image_files)
 
 
 def plot_ref_images(img_list, mask_list, vis_background_list, grid_size, save_path, title = "Reference Images", img_names = None):
@@ -168,8 +195,7 @@ def get_dataset_info(dataset, preprocess, data_path=None):
             rotation_default = {o: False for o in objects}
     else:
         # raise ValueError(f"Dataset '{dataset}' not yet covered!")
-        print(f"Dataset '{dataset}' not yet covered! Trying to infer objects from data_path, using default setting ('agnostic_no_mask').")
-        preprocess = "agnostic_no_mask" # adapt this to your needs -> create custom settings as needed like for MVTec or VisA above
+        print(f"Dataset '{dataset}' not yet covered! Trying to infer objects from data_path, using custom defaults (masking off, rotation on) before applying any force_* overrides.")
 
         if data_path is None:
             raise ValueError("Please provide 'data_path' when using custom dataset!")

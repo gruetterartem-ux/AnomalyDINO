@@ -7,7 +7,6 @@ from sklearn.metrics import auc, roc_auc_score, average_precision_score, f1_scor
 import numpy as np
 import os
 import numpy as np
-import cv2
 from os import makedirs, path, listdir
 import argparse
 from PIL import Image
@@ -16,7 +15,7 @@ import tifffile as tiff
 from scipy.ndimage import label
 from bisect import bisect
 
-from src.utils import dists2map
+from src.utils import dists2map, list_image_files
 
 
 
@@ -33,6 +32,7 @@ def parse_dataset_files(object_name, dataset_base_dir, anomaly_maps_dir, dataset
 
     # Store a list of all corresponding anomaly map filenames.
     prediction_filenames = []
+    test_image_filenames = []
 
     # Test images are located here.
     test_dir = path.join(dataset_base_dir, object_name, 'test')
@@ -45,11 +45,13 @@ def parse_dataset_files(object_name, dataset_base_dir, anomaly_maps_dir, dataset
         if not subdir.replace('_', '').isalpha():
             continue
 
+        subdir_path = path.join(test_dir, subdir)
+        recursive_test_scan = any(path.isdir(path.join(subdir_path, entry))
+                                  for entry in listdir(subdir_path))
+
         # Get paths to all test images in the dataset for this subdir.
-        test_images = [path.splitext(file)[0]
-                       for file
-                       in listdir(path.join(test_dir, subdir))
-                       if path.splitext(file)[1] == ('.png' if dataset == "MVTec" else '.JPG')]
+        test_image_files = list_image_files(subdir_path, recursive=recursive_test_scan)
+        test_images = [path.splitext(file)[0] for file in test_image_files]
 
         # If subdir is not 'good', derive corresponding GT names.
         if subdir != 'good':
@@ -64,10 +66,13 @@ def parse_dataset_files(object_name, dataset_base_dir, anomaly_maps_dir, dataset
         prediction_filenames.extend(
             [path.join(anomaly_maps_base_dir, subdir, file)
              for file in test_images])
+        test_image_filenames.extend(
+            [path.join(test_dir, subdir, file)
+             for file in test_image_files])
 
     print(f"Parsed {len(gt_filenames)} ground truth image files.")
 
-    return gt_filenames, prediction_filenames
+    return gt_filenames, prediction_filenames, test_image_filenames
 
 
 def trapezoid(x, y, x_max=None):
@@ -351,42 +356,31 @@ def eval_segmentation(gt_filenames, prediction_filenames, pro_integration_limit=
     return au_pro, auroc_px, f1_px
 
 
-def eval_classification(gt_filenames, prediction_filenames, aggregation_statistics = "meantop1p"):
+def eval_classification(gt_filenames, prediction_filenames, test_image_filenames, aggregation_statistics = "meantop1p"):
     # Read all ground truth and anomaly images.
     ground_truth = []
     predictions = []
 
-    gt_img_size = []
-
     print("Read ground truth files and corresponding predictions...")
-    for (gt_name, pred_name) in tqdm(zip(gt_filenames, prediction_filenames),
-                                     total=len(gt_filenames)):
-        prediction = np.load(pred_name + '.npy') 
+    for (gt_name, pred_name, test_image_name) in tqdm(zip(gt_filenames, prediction_filenames, test_image_filenames),
+                                                       total=len(gt_filenames)):
+        prediction = np.load(pred_name + '.npy')
         predictions.append(prediction)
 
-        if aggregation_statistics == "max_anomaly_map":
-            # read in the test image to get the shape of the anomaly map
-            img = pred_name.split("/")[-4:]
-            # img = "data/mvtec_anomaly_detection/" + "/".join(img) + ".png"
-            img = "data/VisA_pytorch/1cls/" + "/".join(img) + ".JPG"
-            image_test = cv2.imread(img, cv2.IMREAD_GRAYSCALE)
-            gt_img_size.append(image_test.shape)        
+        # Derive image-level labels directly from the dataset split:
+        # gt_name is None -> good image -> label 0
+        # gt_name exists -> anomalous image -> label 1
+        ground_truth.append(0 if gt_name is None else 1)
 
-        if gt_name is not None:
-            ground_truth.append(np.asarray(Image.open(gt_name)))
-        else:
-            ground_truth.append(np.zeros(prediction.shape))
-    
-    # derive binary labels (0 = anomaly free, 1 = anomalous)
-    binary_labels = [int(np.any(x > 0)) for x in ground_truth]
-    del ground_truth
+    binary_labels = ground_truth
 
     if aggregation_statistics == "meantop1p":
         predictions = [mean_top1p(dist.flatten()) for dist in predictions]
-    elif aggregation_statistics == "max_anomaly_map":
-        predictions = [max_anomaly_map(dist.flatten(), img_size) for dist, img_size in zip(predictions, gt_img_size)]
     elif aggregation_statistics == "max_patch_distance":
         predictions = [np.max(dist.flatten()) for dist in predictions]
+    elif aggregation_statistics == "max_anomaly_map":
+        image_shapes = [np.asarray(Image.open(test_image_name)).shape for test_image_name in test_image_filenames]
+        predictions = [max_anomaly_map(dist, img_shape) for dist, img_shape in zip(predictions, image_shapes)]
     else:
         raise ValueError(f"Unknown aggregation statistics: {aggregation_statistics}")
 
@@ -397,21 +391,29 @@ def eval_classification(gt_filenames, prediction_filenames, aggregation_statisti
     # Compute image-level Average Precision (AP)
     ap_clf = average_precision_score(binary_labels, predictions)
     print(f"Average Precision (image-level): {ap_clf}", end=" -- ")
-  
+
     # Compute image_level F1 score
     precisions, recalls, thresholds = precision_recall_curve(binary_labels, predictions)
     f1_scores = (2 * precisions * recalls) / (precisions + recalls)
     f1_clf = np.max(f1_scores[np.isfinite(f1_scores)])
-    
+
     print(f"F1 (image-level): {f1_clf}")
     return auroc_clf, ap_clf, f1_clf
 
 
 def get_objects_from_dataset(dataset):
     if dataset == "MVTec":
-        objects = ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut", "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"]
+        objects = ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut",
+                   "leather", "metal_nut", "pill", "screw", "tile", "toothbrush",
+                   "transistor", "wood", "zipper"]
     elif dataset == "VisA":
-        objects = ["candle", "capsules", "cashew", "chewinggum", "fryum", "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum"]
+        objects = ["candle", "capsules", "cashew", "chewinggum", "fryum",
+                   "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4",
+                   "pipe_fryum"]
+    elif dataset == "CUSTOM":
+        objects = ["buttons"]
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
     return objects
     
 
@@ -443,6 +445,7 @@ def eval_finished_run(dataset, dataset_base_dir, anomaly_maps_dir, output_dir, s
     auroc_clf_ls = []
     ap_clf_ls = []
     f1_clf_ls = []
+    performed_segmentation_eval = False
 
     # Evaluate each dataset object separately.
     for obj in objects:
@@ -451,7 +454,7 @@ def eval_finished_run(dataset, dataset_base_dir, anomaly_maps_dir, output_dir, s
 
         # Parse the filenames of all ground truth and corresponding anomaly
         # images for this object.
-        gt_filenames, prediction_filenames = \
+        gt_filenames, prediction_filenames, test_image_filenames = \
             parse_dataset_files(
                 object_name=obj,
                 dataset_base_dir=dataset_base_dir,
@@ -461,22 +464,30 @@ def eval_finished_run(dataset, dataset_base_dir, anomaly_maps_dir, output_dir, s
         print(f"Number of images: {len(gt_filenames)}")
         
         if eval_segm:
-            # Evaluate segmentation performance
-            au_pro, auroc_px, f1_px = \
-                eval_segmentation(
-                    gt_filenames,
-                    prediction_filenames,
-                    pro_integration_limit=pro_integration_limit,
-                    delete_tiff_files=delete_tiff_files)
+            missing_gt_masks = [gt_name for gt_name in gt_filenames
+                                if gt_name is not None and not path.exists(gt_name)]
 
-            evaluation_dict[obj]['seg_AUPRO'] = au_pro
-            evaluation_dict[obj]['seg_AUROC'] = auroc_px
-            evaluation_dict[obj]['seg_F1'] = f1_px
+            if missing_gt_masks:
+                print(f"Skipping segmentation evaluation for {obj}: "
+                      f"missing ground-truth masks (e.g. {missing_gt_masks[0]}).")
+            else:
+                # Evaluate segmentation performance
+                au_pro, auroc_px, f1_px = \
+                    eval_segmentation(
+                        gt_filenames,
+                        prediction_filenames,
+                        pro_integration_limit=pro_integration_limit,
+                        delete_tiff_files=delete_tiff_files)
 
-            # Keep track of the mean performance measures.
-            au_pro_ls.append(au_pro)
-            auroc_px_ls.append(auroc_px)
-            f1_px_ls.append(f1_px)
+                evaluation_dict[obj]['seg_AUPRO'] = au_pro
+                evaluation_dict[obj]['seg_AUROC'] = auroc_px
+                evaluation_dict[obj]['seg_F1'] = f1_px
+
+                # Keep track of the mean performance measures.
+                au_pro_ls.append(au_pro)
+                auroc_px_ls.append(auroc_px)
+                f1_px_ls.append(f1_px)
+                performed_segmentation_eval = True
             
         if eval_clf:
         # Evaluate classification performance
@@ -484,6 +495,7 @@ def eval_finished_run(dataset, dataset_base_dir, anomaly_maps_dir, output_dir, s
                 eval_classification(
                     gt_filenames,
                     prediction_filenames,
+                    test_image_filenames,
                     aggregation_statistics = aggregation_statistics)
 
             evaluation_dict[obj]['classification_AUROC'] = auroc_clf
@@ -496,7 +508,7 @@ def eval_finished_run(dataset, dataset_base_dir, anomaly_maps_dir, output_dir, s
             f1_clf_ls.append(f1_clf)
 
     # Compute the mean of the performance measures.
-    if eval_segm:
+    if performed_segmentation_eval:
         evaluation_dict['mean_au_pro'] = np.mean(au_pro_ls).item()
         evaluation_dict['mean_segmentation_au_roc'] = np.mean(auroc_px_ls).item()
         evaluation_dict['mean_segmentation_f1'] = np.mean(f1_px_ls).item()

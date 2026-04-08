@@ -8,7 +8,7 @@ import tifffile as tiff
 import time
 import torch
 
-from src.utils import augment_image, dists2map, plot_ref_images
+from src.utils import augment_image, dists2map, plot_ref_images, list_image_files
 from src.post_eval import mean_top1p
 
 def run_anomaly_detection(
@@ -19,6 +19,9 @@ def run_anomaly_detection(
         object_anomalies,
         plots_dir,
         save_examples = False,
+        random_ref_samples = False,
+        use_last_ref_samples = False,
+        ref_image_names = None,
         masking = None,
         mask_ref_images = False,
         rotation = False,
@@ -26,6 +29,8 @@ def run_anomaly_detection(
         knn_neighbors = 1,
         faiss_on_cpu = False,
         seed = 0,
+        aggregation_statistics = "meantop1p",
+        inference_split = "test",
         save_patch_dists = True,
         save_tiffs = False):
     """
@@ -49,14 +54,19 @@ def run_anomaly_detection(
     """
 
     assert knn_metric in ["L2", "L2_normalized"]
+    assert aggregation_statistics in ["meantop1p", "max_patch_distance", "max_anomaly_map"]
+    assert inference_split in ["test", "train"]
     
-    type_anomalies = object_anomalies[object_name]
-    # add 'good' to the anomaly types, if exists...
-    good_folder = f"{data_root}/{object_name}/test/good/"
-    if os.path.exists(good_folder):
-        type_anomalies.append('good')
+    if inference_split == "train":
+        type_anomalies = ["good"]
     else:
-        print(f"Warning: no 'good' test folder for {object_name} (expected to be at {good_folder})! Just running inference, no evaluation will be performed.")
+        type_anomalies = list(object_anomalies[object_name])
+        # add 'good' to the anomaly types, if exists...
+        good_folder = f"{data_root}/{object_name}/test/good/"
+        if os.path.exists(good_folder):
+            type_anomalies.append('good')
+        else:
+            print(f"Warning: no 'good' test folder for {object_name} (expected to be at {good_folder})! Just running inference, no evaluation will be performed.")
 
     # ensure that each type is only evaluated once
     type_anomalies = list(set(type_anomalies))
@@ -70,12 +80,29 @@ def run_anomaly_detection(
     img_ref_folder = f"{data_root}/{object_name}/train/good/"
     if n_ref_samples == -1:
         # full-shot setting
-        img_ref_samples = sorted(os.listdir(img_ref_folder))
+        img_ref_samples = list_image_files(img_ref_folder)
     else:
-        # few-shot setting, pick samples in deterministic fashion according to seed
-        img_ref_samples = sorted(os.listdir(img_ref_folder))[seed*n_ref_samples:(seed + 1)*n_ref_samples]
+        # few-shot setting
+        all_ref_samples = list_image_files(img_ref_folder)
+        if ref_image_names is not None:
+            missing_ref_samples = [img_name for img_name in ref_image_names if img_name not in all_ref_samples]
+            if missing_ref_samples:
+                raise FileNotFoundError(
+                    f"Explicit reference samples not found in {img_ref_folder}: {missing_ref_samples}"
+                )
+            img_ref_samples = list(ref_image_names)
+        elif use_last_ref_samples:
+            sample_count = min(n_ref_samples, len(all_ref_samples))
+            img_ref_samples = all_ref_samples[-sample_count:]
+        elif random_ref_samples:
+            rng = np.random.default_rng(seed)
+            sample_count = min(n_ref_samples, len(all_ref_samples))
+            img_ref_samples = sorted(rng.choice(all_ref_samples, size=sample_count, replace=False).tolist())
+        else:
+            # pick samples in deterministic fashion according to seed
+            img_ref_samples = all_ref_samples[seed*n_ref_samples:(seed + 1)*n_ref_samples]
 
-    if len(img_ref_samples) < n_ref_samples:
+    if n_ref_samples != -1 and len(img_ref_samples) < n_ref_samples:
         print(f"Warning: Not enough reference samples for {object_name}! Only {len(img_ref_samples)} samples available.")
     
     with torch.inference_mode():
@@ -135,17 +162,20 @@ def run_anomaly_detection(
         anomaly_scores = {}
 
         idx = 0
-        # Evaluate anomalies for each anomaly type (and "good")
-        for type_anomaly in tqdm(type_anomalies, desc = f"processing test samples ({object_name})"):
-            data_dir = f"{data_root}/{object_name}/test/{type_anomaly}"
-            
+        # Evaluate samples for each anomaly type (and/or "good")
+        for type_anomaly in tqdm(type_anomalies, desc = f"processing {inference_split} samples ({object_name})"):
+            data_dir = f"{data_root}/{object_name}/{inference_split}/{type_anomaly}"
+            recursive_test_scan = any(os.path.isdir(os.path.join(data_dir, entry))
+                                      for entry in os.listdir(data_dir))
+            test_image_files = list_image_files(data_dir, recursive=recursive_test_scan)
+
             if save_patch_dists or save_tiffs:
-                os.makedirs(f"{plots_dir}/anomaly_maps/seed={seed}/{object_name}/test/{type_anomaly}", exist_ok=True)
-            
-            for idx, img_test_nr in tqdm(enumerate(sorted(os.listdir(data_dir))), desc=f"Evaluating object_name'{type_anomaly}'", leave=False, total=len(os.listdir(data_dir))):
+                os.makedirs(f"{plots_dir}/anomaly_maps/seed={seed}/{object_name}/{inference_split}/{type_anomaly}", exist_ok=True)
+
+            for idx, img_test_nr in tqdm(enumerate(test_image_files), desc=f"Evaluating object_name'{type_anomaly}'", leave=False, total=len(test_image_files)):
                 # start measuring time (inference)
                 start_time = time.time()
-                image_test_path = f"{data_dir}/{img_test_nr}"
+                image_test_path = os.path.join(data_dir, img_test_nr)
 
                 # Extract test features
                 image_test = cv2.cvtColor(cv2.imread(image_test_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
@@ -185,15 +215,25 @@ def run_anomaly_detection(
                 torch.cuda.synchronize() # Synchronize CUDA kernels before measuring time
                 inf_time = time.time() - start_time
                 inference_times[f"{type_anomaly}/{img_test_nr}"] = inf_time
-                anomaly_scores[f"{type_anomaly}/{img_test_nr}"] = mean_top1p(output_distances.flatten())
+                if aggregation_statistics == "meantop1p":
+                    image_score = mean_top1p(output_distances.flatten())
+                elif aggregation_statistics == "max_patch_distance":
+                    image_score = np.max(output_distances.flatten())
+                else:
+                    image_score = np.max(dists2map(d_masked, image_test.shape))
+
+                anomaly_scores[f"{type_anomaly}/{img_test_nr}"] = image_score
 
                 # Save the anomaly maps (raw as .npy or full resolution .tiff files)
-                img_test_nr = img_test_nr.split(".")[0]
+                img_test_nr = os.path.splitext(img_test_nr)[0]
+                output_base = os.path.join(plots_dir, "anomaly_maps", f"seed={seed}",
+                                           object_name, inference_split, type_anomaly, img_test_nr)
+                os.makedirs(os.path.dirname(output_base), exist_ok=True)
                 if save_tiffs:
                     anomaly_map = dists2map(d_masked, image_test.shape)
-                    tiff.imwrite(f"{plots_dir}/anomaly_maps/seed={seed}/{object_name}/test/{type_anomaly}/{img_test_nr}.tiff", anomaly_map)
+                    tiff.imwrite(output_base + ".tiff", anomaly_map)
                 if save_patch_dists:
-                    np.save(f"{plots_dir}/anomaly_maps/seed={seed}/{object_name}/test/{type_anomaly}/{img_test_nr}.npy", d_masked)
+                    np.save(output_base + ".npy", d_masked)
 
                 # Save some example plots (3 per anomaly type)
                 if save_examples and idx < 3:
@@ -209,8 +249,13 @@ def run_anomaly_detection(
                     plt.colorbar(ax3.imshow(d_masked), ax=ax3, fraction=0.12, pad=0.05, orientation="horizontal")
                     
                     # compute image level anomaly score (mean(top 1%) of patches = empirical tail value at risk for quantile 0.99)
-                    score_top1p = mean_top1p(distances)
-                    ax4.axvline(score_top1p, color='r', linestyle='dashed', linewidth=1, label=f"Anomaly Score: {score_top1p:.3f}")
+                    if aggregation_statistics == "meantop1p":
+                        score_value = mean_top1p(distances)
+                    elif aggregation_statistics == "max_patch_distance":
+                        score_value = np.max(distances)
+                    else:
+                        score_value = np.max(dists2map(d_masked, image_test.shape))
+                    ax4.axvline(score_value, color='r', linestyle='dashed', linewidth=1, label=f"Anomaly Score: {score_value:.3f}")
                     ax4.legend()
                     ax4.hist(distances.flatten())
 
@@ -221,7 +266,7 @@ def run_anomaly_detection(
                     ax1.title.set_text("Test Image")
                     ax2.title.set_text("Test Image (PCA + Mask)")
                     ax3.title.set_text("Patch Distances (1NN)")
-                    ax4.title.set_text("Histogram of Distances")
+                    ax4.title.set_text(f"Histogram of Distances ({aggregation_statistics})")
 
                     plt.suptitle(f"Object: {object_name}, Type: {type_anomaly}, img_path = ...{image_test_path[-40:]}, filtered patches (by masking)/all patches = {mask2.sum()}/{mask2.size}")
 

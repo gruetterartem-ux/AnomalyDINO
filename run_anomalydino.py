@@ -39,11 +39,23 @@ def parse_args():
     parser.add_argument("--shots", nargs='+', type=int, default=[1], #action=IntListAction,
                         help="List of shots to evaluate. Full-shot scenario is -1.")
     parser.add_argument("--num_seeds", type=int, default=1)
+    parser.add_argument("--random_ref_samples", default=False, action=argparse.BooleanOptionalAction,
+                        help="Sample few-shot reference images randomly without replacement instead of using a deterministic slice.")
+    parser.add_argument("--use_last_ref_samples", default=False, action=argparse.BooleanOptionalAction,
+                        help="Use the last few-shot reference images from the sorted train/good list.")
+    parser.add_argument("--ref_image_names", nargs="+", default=None,
+                        help="Explicit train/good reference image filenames to use instead of sampled few-shot references.")
     parser.add_argument("--mask_ref_images", type=bool, default=False)
     parser.add_argument("--just_seed", type=int, default=None)
     parser.add_argument('--save_examples', default=True, action=argparse.BooleanOptionalAction, help="Save example plots.")
     parser.add_argument("--eval_clf", default=True, action=argparse.BooleanOptionalAction, help="Evaluate anomaly detection performance.")
     parser.add_argument("--eval_segm", default=False, action=argparse.BooleanOptionalAction, help="Evaluate anomaly segmentation performance.")
+    parser.add_argument("--aggregation_statistics", type=str, default="meantop1p",
+                        choices=["meantop1p", "max_patch_distance", "max_anomaly_map"],
+                        help="Image-level aggregation for anomaly scores.")
+    parser.add_argument("--inference_split", type=str, default="test",
+                        choices=["test", "train"],
+                        help="Dataset split to run inference on.")
     parser.add_argument("--device", default='cuda:0')
     parser.add_argument("--warmup_iters", type=int, default=25, help="Number of warmup iterations, relevant when benchmarking inference time.")
 
@@ -130,6 +142,9 @@ if __name__=="__main__":
                                                                                 object_anomalies = object_anomalies,
                                                                                 plots_dir = plots_dir,
                                                                                 save_examples = save_examples,
+                                                                                random_ref_samples = args.random_ref_samples,
+                                                                                use_last_ref_samples = args.use_last_ref_samples,
+                                                                                ref_image_names = args.ref_image_names,
                                                                                 knn_metric = args.knn_metric,
                                                                                 knn_neighbors = args.k_neighbors,
                                                                                 faiss_on_cpu = args.faiss_on_cpu,
@@ -137,7 +152,9 @@ if __name__=="__main__":
                                                                                 mask_ref_images = args.mask_ref_images,
                                                                                 rotation = rotation_default[object_name],
                                                                                 seed = seed,
-                                                                                save_patch_dists = args.eval_clf, # save patch distances for detection evaluation
+                                                                                aggregation_statistics = args.aggregation_statistics,
+                                                                                inference_split = args.inference_split,
+                                                                                save_patch_dists = (args.eval_clf or args.inference_split != "test"), # keep patch maps for non-test inference runs
                                                                                 save_tiffs = args.eval_segm)      # save anomaly maps as tiffs for segmentation evaluation
                         
                         # write anomaly scores and inference times to file
@@ -153,6 +170,11 @@ if __name__=="__main__":
                     next(reader)
                     inference_times = [float(row[4]) for row in reader]
                 print(f"Finished AD for {len(objects)} objects (seed {seed}), mean inference time: {sum(inference_times)/len(inference_times):.5f} s/sample = {len(inference_times)/(sum(inference_times)+1e-10):.2f} samples/s")
+
+                if args.inference_split != "test":
+                    print(f"Finished AD without evaluation on split '{args.inference_split}', inference results saved to {results_dir}")
+                    save_examples = False
+                    continue
 
                 # check wheter 'good' folder exists for testing
                 for object_name in objects:
@@ -171,7 +193,8 @@ if __name__=="__main__":
                                     seed = seed,
                                     pro_integration_limit = 0.3,
                                     eval_clf = args.eval_clf,
-                                    eval_segm = args.eval_segm)
+                                    eval_segm = args.eval_segm,
+                                    aggregation_statistics = args.aggregation_statistics)
                     
                     create_sample_plots(results_dir, 
                                         anomaly_maps_dir = results_dir + f"/anomaly_maps/seed={seed}", 
