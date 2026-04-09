@@ -1,14 +1,16 @@
 import argparse
+import math
 import os
 from argparse import ArgumentParser, Action 
 import yaml
 from tqdm import trange
 
 import csv
+import json
 
 from src.utils import get_dataset_info 
 from src.detection import run_anomaly_detection
-from src.post_eval import eval_finished_run
+from src.post_eval import eval_finished_run, eval_classification_scores
 from src.visualize import create_sample_plots
 from src.backbones import get_model
 
@@ -56,6 +58,8 @@ def parse_args():
     parser.add_argument("--inference_split", type=str, default="test",
                         choices=["test", "train"],
                         help="Dataset split to run inference on.")
+    parser.add_argument("--eval_remaining_train_good", default=False, action=argparse.BooleanOptionalAction,
+                        help="Evaluate on remaining train/good images plus test/good and test anomalies, excluding the selected reference images.")
     parser.add_argument("--device", default='cuda:0')
     parser.add_argument("--warmup_iters", type=int, default=25, help="Number of warmup iterations, relevant when benchmarking inference time.")
 
@@ -120,7 +124,8 @@ if __name__=="__main__":
                 measurements_file = results_dir + f"/measurements_seed={seed}.csv"
                 with open(measurements_file, 'w', newline='') as file:
                     writer = csv.writer(file)
-                    writer.writerow(["Object", "Sample", "Anomaly_Score", "MemoryBank_Time", "Inference_Time"])
+                    writer.writerow(["Object", "Sample", "Anomaly_Score", "MemoryBank_Time", "Inference_Time", "Label", "Evaluation_Group", "Threshold"])
+                    score_cache = {}
 
                     for object_name in objects:
                         
@@ -134,7 +139,7 @@ if __name__=="__main__":
                             img_tensor, grid_size = model.prepare_image(f"{args.data_root}/{object_name}/train/good/{first_image}")
                             features = model.extract_features(img_tensor)
                                          
-                        anomaly_scores, time_memorybank, time_inference = run_anomaly_detection(
+                        anomaly_scores, time_memorybank, time_inference, ref_images, sample_metadata = run_anomaly_detection(
                                                                                 model,
                                                                                 object_name,
                                                                                 data_root = args.data_root, 
@@ -154,14 +159,41 @@ if __name__=="__main__":
                                                                                 seed = seed,
                                                                                 aggregation_statistics = args.aggregation_statistics,
                                                                                 inference_split = args.inference_split,
+                                                                                eval_remaining_train_good = args.eval_remaining_train_good,
                                                                                 save_patch_dists = (args.eval_clf or args.inference_split != "test"), # keep patch maps for non-test inference runs
                                                                                 save_tiffs = args.eval_segm)      # save anomaly maps as tiffs for segmentation evaluation
+
+                        score_cache[object_name] = {
+                            "scores": anomaly_scores,
+                            "metadata": sample_metadata,
+                        }
+
+                        with open(f"{results_dir}/reference_images_{object_name}_seed={seed}.json", "w") as ref_file:
+                            json.dump(ref_images, ref_file, indent=2)
+
+                        object_threshold = ""
+                        labels = [info.get("label") for info in sample_metadata.values() if info.get("label", "") != ""]
+                        if labels and len(set(labels)) > 1:
+                            scores = [anomaly_scores[sample] for sample in sample_metadata.keys()]
+                            _, _, _, clf_details = eval_classification_scores(labels, scores, return_details=True)
+                            if math.isfinite(clf_details["threshold"]):
+                                object_threshold = f"{clf_details['threshold']:.5f}"
                         
                         # write anomaly scores and inference times to file
                         for counter, sample in enumerate(anomaly_scores.keys()):
                             anomaly_score = anomaly_scores[sample]
                             inference_time = time_inference[sample]
-                            writer.writerow([object_name, sample, f"{anomaly_score:.5f}", f"{time_memorybank:.5f}", f"{inference_time:.5f}"])
+                            sample_info = sample_metadata.get(sample, {})
+                            writer.writerow([
+                                object_name,
+                                sample,
+                                f"{anomaly_score:.5f}",
+                                f"{time_memorybank:.5f}",
+                                f"{inference_time:.5f}",
+                                sample_info.get("label", ""),
+                                sample_info.get("group", ""),
+                                object_threshold,
+                            ])
                         # print(f"Mean inference time ({object_name}): {sum(time_inference.values())/len(time_inference):.5f} s/sample")                        
 
                 # read inference times from file
@@ -170,6 +202,40 @@ if __name__=="__main__":
                     next(reader)
                     inference_times = [float(row[4]) for row in reader]
                 print(f"Finished AD for {len(objects)} objects (seed {seed}), mean inference time: {sum(inference_times)/len(inference_times):.5f} s/sample = {len(inference_times)/(sum(inference_times)+1e-10):.2f} samples/s")
+
+                if args.eval_remaining_train_good:
+                    print(f"=========== Evaluate seed = {seed} (remaining train/good + test) ===========")
+                    evaluation_dict = {}
+                    auroc_clf_ls = []
+                    ap_clf_ls = []
+                    f1_clf_ls = []
+
+                    for object_name in objects:
+                        labels = [info["label"] for _, info in score_cache[object_name]["metadata"].items()]
+                        scores = [score_cache[object_name]["scores"][sample] for sample in score_cache[object_name]["metadata"].keys()]
+                        auroc_clf, ap_clf, f1_clf, clf_details = eval_classification_scores(labels, scores, return_details=True)
+                        print(f"{object_name}: AUROC (image-level): {auroc_clf} -- Average Precision (image-level): {ap_clf} -- F1 (image-level): {f1_clf}")
+
+                        evaluation_dict[object_name] = {
+                            "classification_AUROC": auroc_clf,
+                            "classification_AP": ap_clf,
+                            "classification_F1": f1_clf,
+                            "classification_threshold": clf_details["threshold"],
+                        }
+                        auroc_clf_ls.append(auroc_clf)
+                        ap_clf_ls.append(ap_clf)
+                        f1_clf_ls.append(f1_clf)
+
+                    evaluation_dict['mean_classification_au_roc'] = float(sum(auroc_clf_ls) / len(auroc_clf_ls))
+                    evaluation_dict['mean_classification_ap'] = float(sum(ap_clf_ls) / len(ap_clf_ls))
+                    evaluation_dict['mean_classification_f1'] = float(sum(f1_clf_ls) / len(f1_clf_ls))
+
+                    with open(f"{results_dir}/metrics_seed={seed}.json", "w") as metric_file:
+                        json.dump(evaluation_dict, metric_file, indent=4)
+                    print(f"Wrote metrics to {results_dir}/metrics_seed={seed}.json")
+
+                    save_examples = False
+                    continue
 
                 if args.inference_split != "test":
                     print(f"Finished AD without evaluation on split '{args.inference_split}', inference results saved to {results_dir}")

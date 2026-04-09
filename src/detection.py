@@ -31,6 +31,7 @@ def run_anomaly_detection(
         seed = 0,
         aggregation_statistics = "meantop1p",
         inference_split = "test",
+        eval_remaining_train_good = False,
         save_patch_dists = True,
         save_tiffs = False):
     """
@@ -56,10 +57,10 @@ def run_anomaly_detection(
     assert knn_metric in ["L2", "L2_normalized"]
     assert aggregation_statistics in ["meantop1p", "max_patch_distance", "max_anomaly_map"]
     assert inference_split in ["test", "train"]
-    
-    if inference_split == "train":
+
+    if not eval_remaining_train_good and inference_split == "train":
         type_anomalies = ["good"]
-    else:
+    elif not eval_remaining_train_good:
         type_anomalies = list(object_anomalies[object_name])
         # add 'good' to the anomaly types, if exists...
         good_folder = f"{data_root}/{object_name}/test/good/"
@@ -69,7 +70,8 @@ def run_anomaly_detection(
             print(f"Warning: no 'good' test folder for {object_name} (expected to be at {good_folder})! Just running inference, no evaluation will be performed.")
 
     # ensure that each type is only evaluated once
-    type_anomalies = list(set(type_anomalies))
+    if not eval_remaining_train_good:
+        type_anomalies = list(set(type_anomalies))
 
     # Extract reference features
     features_ref = []
@@ -78,12 +80,12 @@ def run_anomaly_detection(
     vis_backgroud = []
 
     img_ref_folder = f"{data_root}/{object_name}/train/good/"
+    all_ref_samples = list_image_files(img_ref_folder)
     if n_ref_samples == -1:
         # full-shot setting
-        img_ref_samples = list_image_files(img_ref_folder)
+        img_ref_samples = all_ref_samples
     else:
         # few-shot setting
-        all_ref_samples = list_image_files(img_ref_folder)
         if ref_image_names is not None:
             missing_ref_samples = [img_name for img_name in ref_image_names if img_name not in all_ref_samples]
             if missing_ref_samples:
@@ -160,19 +162,71 @@ def run_anomaly_detection(
         
         inference_times = {}
         anomaly_scores = {}
+        sample_metadata = {}
 
-        idx = 0
-        # Evaluate samples for each anomaly type (and/or "good")
-        for type_anomaly in tqdm(type_anomalies, desc = f"processing {inference_split} samples ({object_name})"):
-            data_dir = f"{data_root}/{object_name}/{inference_split}/{type_anomaly}"
-            recursive_test_scan = any(os.path.isdir(os.path.join(data_dir, entry))
-                                      for entry in os.listdir(data_dir))
-            test_image_files = list_image_files(data_dir, recursive=recursive_test_scan)
+        if eval_remaining_train_good:
+            ref_sample_set = set(img_ref_samples)
+            eval_groups = []
+
+            remaining_train_good = [img_name for img_name in all_ref_samples if img_name not in ref_sample_set]
+            eval_groups.append({
+                "storage_group": "good_train_remaining",
+                "display_group": "good_train_remaining",
+                "data_dir": img_ref_folder,
+                "files": remaining_train_good,
+                "label": 0,
+            })
+
+            good_test_dir = f"{data_root}/{object_name}/test/good"
+            if os.path.exists(good_test_dir):
+                recursive_good_test_scan = any(os.path.isdir(os.path.join(good_test_dir, entry))
+                                               for entry in os.listdir(good_test_dir))
+                eval_groups.append({
+                    "storage_group": "good_test",
+                    "display_group": "good_test",
+                    "data_dir": good_test_dir,
+                    "files": list_image_files(good_test_dir, recursive=recursive_good_test_scan),
+                    "label": 0,
+                })
+
+            for type_anomaly in list(set(object_anomalies[object_name])):
+                data_dir = f"{data_root}/{object_name}/test/{type_anomaly}"
+                recursive_test_scan = any(os.path.isdir(os.path.join(data_dir, entry))
+                                          for entry in os.listdir(data_dir))
+                eval_groups.append({
+                    "storage_group": type_anomaly,
+                    "display_group": f"test/{type_anomaly}",
+                    "data_dir": data_dir,
+                    "files": list_image_files(data_dir, recursive=recursive_test_scan),
+                    "label": 1,
+                })
+        else:
+            eval_groups = []
+            for type_anomaly in type_anomalies:
+                data_dir = f"{data_root}/{object_name}/{inference_split}/{type_anomaly}"
+                recursive_test_scan = any(os.path.isdir(os.path.join(data_dir, entry))
+                                          for entry in os.listdir(data_dir))
+                eval_groups.append({
+                    "storage_group": type_anomaly,
+                    "display_group": type_anomaly,
+                    "data_dir": data_dir,
+                    "files": list_image_files(data_dir, recursive=recursive_test_scan),
+                    "label": 0 if type_anomaly == "good" else 1,
+                })
+
+        for eval_group in tqdm(eval_groups, desc=f"processing evaluation groups ({object_name})"):
+            group_name = eval_group["storage_group"]
+            display_group = eval_group["display_group"]
+            data_dir = eval_group["data_dir"]
+            test_image_files = eval_group["files"]
+            label = eval_group["label"]
+
+            output_group_root = "custom_eval" if eval_remaining_train_good else inference_split
 
             if save_patch_dists or save_tiffs:
-                os.makedirs(f"{plots_dir}/anomaly_maps/seed={seed}/{object_name}/{inference_split}/{type_anomaly}", exist_ok=True)
+                os.makedirs(f"{plots_dir}/anomaly_maps/seed={seed}/{object_name}/{output_group_root}/{group_name}", exist_ok=True)
 
-            for idx, img_test_nr in tqdm(enumerate(test_image_files), desc=f"Evaluating object_name'{type_anomaly}'", leave=False, total=len(test_image_files)):
+            for idx, img_test_nr in tqdm(enumerate(test_image_files), desc=f"Evaluating '{display_group}'", leave=False, total=len(test_image_files)):
                 # start measuring time (inference)
                 start_time = time.time()
                 image_test_path = os.path.join(data_dir, img_test_nr)
@@ -214,7 +268,8 @@ def run_anomaly_detection(
                 # save inference time
                 torch.cuda.synchronize() # Synchronize CUDA kernels before measuring time
                 inf_time = time.time() - start_time
-                inference_times[f"{type_anomaly}/{img_test_nr}"] = inf_time
+                sample_key = f"{display_group}/{img_test_nr}".replace("\\", "/")
+                inference_times[sample_key] = inf_time
                 if aggregation_statistics == "meantop1p":
                     image_score = mean_top1p(output_distances.flatten())
                 elif aggregation_statistics == "max_patch_distance":
@@ -222,12 +277,17 @@ def run_anomaly_detection(
                 else:
                     image_score = np.max(dists2map(d_masked, image_test.shape))
 
-                anomaly_scores[f"{type_anomaly}/{img_test_nr}"] = image_score
+                anomaly_scores[sample_key] = image_score
+                sample_metadata[sample_key] = {
+                    "label": label,
+                    "group": display_group,
+                    "image_path": image_test_path,
+                }
 
                 # Save the anomaly maps (raw as .npy or full resolution .tiff files)
                 img_test_nr = os.path.splitext(img_test_nr)[0]
                 output_base = os.path.join(plots_dir, "anomaly_maps", f"seed={seed}",
-                                           object_name, inference_split, type_anomaly, img_test_nr)
+                                           object_name, output_group_root, group_name, img_test_nr)
                 os.makedirs(os.path.dirname(output_base), exist_ok=True)
                 if save_tiffs:
                     anomaly_map = dists2map(d_masked, image_test.shape)
@@ -268,10 +328,11 @@ def run_anomaly_detection(
                     ax3.title.set_text("Patch Distances (1NN)")
                     ax4.title.set_text(f"Histogram of Distances ({aggregation_statistics})")
 
-                    plt.suptitle(f"Object: {object_name}, Type: {type_anomaly}, img_path = ...{image_test_path[-40:]}, filtered patches (by masking)/all patches = {mask2.sum()}/{mask2.size}")
+                    plt.suptitle(f"Object: {object_name}, Type: {display_group}, img_path = ...{image_test_path[-40:]}, filtered patches (by masking)/all patches = {mask2.sum()}/{mask2.size}")
 
                     plt.tight_layout()
-                    plt.savefig(f"{plots_dir}/{object_name}/examples/example_{type_anomaly}_{idx}.png")
+                    safe_group_name = display_group.replace("/", "_").replace("\\", "_")
+                    plt.savefig(f"{plots_dir}/{object_name}/examples/example_{safe_group_name}_{idx}.png")
                     plt.close()
 
-    return anomaly_scores, time_memorybank, inference_times
+    return anomaly_scores, time_memorybank, inference_times, img_ref_samples, sample_metadata

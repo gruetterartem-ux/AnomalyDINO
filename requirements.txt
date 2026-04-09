@@ -12,3 +12,5 @@ tifffile
 argparse
 PyYAML
 pandas
+transformers
+huggingface_hub

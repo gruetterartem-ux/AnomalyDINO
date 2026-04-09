@@ -306,6 +306,41 @@ def max_anomaly_map(distances, img_size):
     return np.max(anomaly_map)
 
 
+def eval_classification_scores(binary_labels, predictions, return_details=False):
+    # Compute image-level AUROC
+    auroc_clf = roc_auc_score(binary_labels, predictions)
+
+    # Compute image-level Average Precision (AP)
+    ap_clf = average_precision_score(binary_labels, predictions)
+
+    # Compute image-level F1 score and the corresponding score threshold.
+    precisions, recalls, thresholds = precision_recall_curve(binary_labels, predictions)
+    f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1])
+    finite_mask = np.isfinite(f1_scores)
+
+    if finite_mask.any():
+        valid_indices = np.flatnonzero(finite_mask)
+        best_idx = valid_indices[np.argmax(f1_scores[finite_mask])]
+        f1_clf = f1_scores[best_idx]
+        threshold = thresholds[best_idx]
+        precision = precisions[:-1][best_idx]
+        recall = recalls[:-1][best_idx]
+    else:
+        f1_clf = float("nan")
+        threshold = float("nan")
+        precision = float("nan")
+        recall = float("nan")
+
+    if return_details:
+        return auroc_clf, ap_clf, f1_clf, {
+            "threshold": float(threshold),
+            "precision": float(precision),
+            "recall": float(recall),
+        }
+
+    return auroc_clf, ap_clf, f1_clf
+
+
 def eval_segmentation(gt_filenames, prediction_filenames, pro_integration_limit=0.3, delete_tiff_files=True):
     # Read all ground truth and anomaly images.
     ground_truth = []
@@ -384,19 +419,10 @@ def eval_classification(gt_filenames, prediction_filenames, test_image_filenames
     else:
         raise ValueError(f"Unknown aggregation statistics: {aggregation_statistics}")
 
-    # Compute image-level AUROC
-    auroc_clf = roc_auc_score(binary_labels, predictions)
+    # Compute image-level AUROC / AP / F1
+    auroc_clf, ap_clf, f1_clf = eval_classification_scores(binary_labels, predictions)
     print(f"AUROC (image-level): {auroc_clf}", end=" -- ")
-
-    # Compute image-level Average Precision (AP)
-    ap_clf = average_precision_score(binary_labels, predictions)
     print(f"Average Precision (image-level): {ap_clf}", end=" -- ")
-
-    # Compute image_level F1 score
-    precisions, recalls, thresholds = precision_recall_curve(binary_labels, predictions)
-    f1_scores = (2 * precisions * recalls) / (precisions + recalls)
-    f1_clf = np.max(f1_scores[np.isfinite(f1_scores)])
-
     print(f"F1 (image-level): {f1_clf}")
     return auroc_clf, ap_clf, f1_clf
 
