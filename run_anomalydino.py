@@ -11,7 +11,7 @@ import json
 from src.utils import get_dataset_info 
 from src.detection import run_anomaly_detection
 from src.post_eval import eval_finished_run, eval_classification_scores
-from src.visualize import create_sample_plots
+from src.visualize import create_sample_plots, export_anomaly_map_pngs
 from src.backbones import get_model
 
 
@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--mask_ref_images", type=bool, default=False)
     parser.add_argument("--just_seed", type=int, default=None)
     parser.add_argument('--save_examples', default=True, action=argparse.BooleanOptionalAction, help="Save example plots.")
+    parser.add_argument('--save_anomaly_map_pngs', default=False, action=argparse.BooleanOptionalAction,
+                        help="Save a PNG anomaly map for every saved .npy anomaly map in the matching folder.")
     parser.add_argument("--eval_clf", default=True, action=argparse.BooleanOptionalAction, help="Evaluate anomaly detection performance.")
     parser.add_argument("--eval_segm", default=False, action=argparse.BooleanOptionalAction, help="Evaluate anomaly segmentation performance.")
     parser.add_argument("--aggregation_statistics", type=str, default="meantop1p",
@@ -267,6 +269,12 @@ if __name__=="__main__":
                                         seed = seed,
                                         dataset = args.dataset, 
                                         data_root = args.data_root)
+
+                    if args.save_anomaly_map_pngs:
+                        export_anomaly_map_pngs(
+                            anomaly_maps_dir=results_dir + f"/anomaly_maps/seed={seed}",
+                            data_root=args.data_root,
+                        )
                 
                     # deactivate creation of examples for the next seeds...
                     save_examples = False 

@@ -427,7 +427,7 @@ def eval_classification(gt_filenames, prediction_filenames, test_image_filenames
     return auroc_clf, ap_clf, f1_clf
 
 
-def get_objects_from_dataset(dataset):
+def get_objects_from_dataset(dataset, dataset_base_dir=None, anomaly_maps_dir=None):
     if dataset == "MVTec":
         objects = ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut",
                    "leather", "metal_nut", "pill", "screw", "tile", "toothbrush",
@@ -437,7 +437,21 @@ def get_objects_from_dataset(dataset):
                    "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4",
                    "pipe_fryum"]
     elif dataset == "CUSTOM":
-        objects = ["buttons"]
+        candidate_roots = [dataset_base_dir, anomaly_maps_dir]
+        objects = None
+        for root in candidate_roots:
+            if root is None or not path.isdir(root):
+                continue
+            inferred = [entry for entry in sorted(listdir(root))
+                        if path.isdir(path.join(root, entry))]
+            if inferred:
+                objects = inferred
+                break
+        if not objects:
+            raise ValueError(
+                "Could not infer CUSTOM dataset objects from "
+                f"dataset_base_dir={dataset_base_dir!r} or anomaly_maps_dir={anomaly_maps_dir!r}."
+            )
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
     return objects
@@ -459,7 +473,9 @@ def eval_finished_run(dataset, dataset_base_dir, anomaly_maps_dir, output_dir, s
     """
 
     # Parse the filenames of all ground truth and corresponding anomaly
-    objects = get_objects_from_dataset(dataset)
+    objects = get_objects_from_dataset(dataset,
+                                       dataset_base_dir=dataset_base_dir,
+                                       anomaly_maps_dir=anomaly_maps_dir)
     # Store evaluation results in this dictionary.
     evaluation_dict = dict()
 
