@@ -1,20 +1,23 @@
 import argparse
 import csv
-import heapq
 import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import yaml
-from PIL import Image
-from scipy.ndimage import label, maximum_filter
+from PIL import Image, ImageDraw
+from scipy.ndimage import binary_dilation, label, maximum_filter
 from torchvision import transforms
+
+
+EIGHT_CONNECTED = np.ones((3, 3), dtype=np.uint8)
+EIGHT_CONNECTED_BOOL = EIGHT_CONNECTED.astype(bool)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export ROI crops from AnomalyDINO patch-distance maps using the saved image-level threshold."
+        description="Export ROI crops from AnomalyDINO patch-distance maps using adaptive peak-centered hysteresis on d_masked."
     )
     parser.add_argument(
         "--experiment-dir",
@@ -29,43 +32,85 @@ def parse_args():
         "--output-dir",
         type=Path,
         default=None,
-        help="Optional output directory. Defaults to <experiment-dir>/roi_crops_peak_seeds/seed=<seed>.",
+        help="Optional output directory. Defaults to <experiment-dir>/roi_crops_peak_hysteresis/seed=<seed>.",
     )
     parser.add_argument(
-        "--crop-size-patches",
-        type=int,
-        default=5,
-        help="Fixed square crop size in patch units. Must be an odd number.",
-    )
-    parser.add_argument(
-        "--grow-threshold-ratio",
+        "--high-prominence-ratio",
         type=float,
-        default=0.7,
-        help="Grow threshold as a ratio of the saved image-level threshold.",
+        default=0.6,
+        help="High hysteresis threshold as b + ratio * (p - b).",
     )
     parser.add_argument(
-        "--max-seeds",
-        type=int,
-        default=3,
-        help="Maximum number of seed groups opened per image.",
+        "--low-prominence-ratio",
+        type=float,
+        default=0.3,
+        help="Low hysteresis threshold as b + ratio * (p - b).",
     )
     parser.add_argument(
-        "--min-seed-distance-patches",
+        "--background-ring-inner",
         type=int,
         default=2,
-        help="Minimum Chebyshev distance in patch units between opened seed groups.",
+        help="Inner Chebyshev distance in patch cells for the local-background ring.",
     )
     parser.add_argument(
-        "--overlap-iou-threshold",
+        "--background-ring-outer",
+        type=int,
+        default=5,
+        help="Outer Chebyshev distance in patch cells for the local-background ring.",
+    )
+    parser.add_argument(
+        "--min-region-patches",
+        type=int,
+        default=1,
+        help="Minimum number of patch cells required for an accepted hysteresis region.",
+    )
+    parser.add_argument(
+        "--min-prominence",
         type=float,
-        default=0.5,
-        help="Reject a weaker crop if its IoU with an already accepted stronger crop reaches this threshold.",
+        default=0.02,
+        help="Minimum local prominence p - b required for an accepted region.",
+    )
+    parser.add_argument(
+        "--min-region-mass",
+        type=float,
+        default=0.05,
+        help="Minimum summed excess score over background within the region.",
+    )
+    parser.add_argument(
+        "--block-boxes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After accepting a region, block its full patch-space bounding box for all later ROIs.",
+    )
+    parser.add_argument(
+        "--merge-gap-patches",
+        type=int,
+        default=0,
+        help="Merge accepted regions whose patch-space bounding boxes touch or come within this many patch cells.",
+    )
+    parser.add_argument(
+        "--merge-bridge-ratio",
+        type=float,
+        default=0.4,
+        help="Only merge nearby regions when they are connected above max(b1,b2) + ratio * min(d1,d2), i.e. without a clear valley.",
+    )
+    parser.add_argument(
+        "--max-boxes-per-image",
+        type=int,
+        default=None,
+        help="Keep only the N strongest final boxes per image. Strength is ranked by region_max_score, then region_mass.",
     )
     parser.add_argument(
         "--include-good",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Also export ROIs for images from the good split if they exceed the threshold.",
+    )
+    parser.add_argument(
+        "--save-overlay-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save one debug image per processed sample with all accepted ROI boxes drawn on the original image.",
     )
     return parser.parse_args()
 
@@ -124,7 +169,7 @@ def resized_image_for_dinov2(image: Image.Image, smaller_edge_size: int) -> Imag
 
 
 def component_boxes(binary_map: np.ndarray) -> Iterable[Tuple[int, int, int, int, np.ndarray]]:
-    labeled, num_components = label(binary_map.astype(np.uint8), structure=np.ones((3, 3), dtype=np.uint8))
+    labeled, num_components = label(binary_map.astype(np.uint8), structure=EIGHT_CONNECTED)
     for component_id in range(1, num_components + 1):
         rows, cols = np.where(labeled == component_id)
         if rows.size == 0:
@@ -132,110 +177,125 @@ def component_boxes(binary_map: np.ndarray) -> Iterable[Tuple[int, int, int, int
         yield rows.min(), rows.max(), cols.min(), cols.max(), labeled == component_id
 
 
-def local_maxima_mask(score_map: np.ndarray) -> np.ndarray:
-    neighborhood = np.ones((3, 3), dtype=np.uint8)
-    local_max = score_map == maximum_filter(score_map, footprint=neighborhood, mode="constant", cval=-np.inf)
-    local_max &= score_map > 0.0
+def local_maxima_mask(score_map: np.ndarray, available_mask: np.ndarray) -> np.ndarray:
+    masked_scores = np.full(score_map.shape, -np.inf, dtype=np.float32)
+    masked_scores[available_mask] = score_map[available_mask]
+    local_max = masked_scores == maximum_filter(masked_scores, footprint=EIGHT_CONNECTED, mode="constant", cval=-np.inf)
+    local_max &= available_mask
     return local_max
 
 
-def build_peak_seed_regions(
-    score_map: np.ndarray,
-    seed_threshold: float,
-    max_seeds: int,
-    min_seed_distance_patches: int,
-) -> Tuple[np.ndarray, Dict[int, float], Dict[int, int], Dict[int, Tuple[int, int]]]:
-    peak_mask = local_maxima_mask(score_map)
-    peak_labels, num_peak_regions = label(peak_mask.astype(np.uint8), structure=np.ones((3, 3), dtype=np.uint8))
+def peak_candidates(score_map: np.ndarray, available_mask: np.ndarray) -> List[Dict[str, object]]:
+    peak_mask = local_maxima_mask(score_map, available_mask)
+    peak_labels, num_peak_regions = label(peak_mask.astype(np.uint8), structure=EIGHT_CONNECTED)
 
-    peak_regions: List[Tuple[float, int]] = []
-    peak_centers: Dict[int, Tuple[float, float]] = {}
-    peak_representatives: Dict[int, Tuple[int, int]] = {}
+    candidates: List[Dict[str, object]] = []
     for peak_region_id in range(1, num_peak_regions + 1):
         region_mask = peak_labels == peak_region_id
+        if not region_mask.any():
+            continue
         peak_score = float(score_map[region_mask].max())
-        peak_regions.append((peak_score, peak_region_id))
-        rows, cols = np.where(region_mask)
-        peak_centers[peak_region_id] = (float(rows.mean()), float(cols.mean()))
-        max_coords = np.argwhere(region_mask & (score_map == peak_score))
-        peak_representatives[peak_region_id] = (int(max_coords[0, 0]), int(max_coords[0, 1]))
+        max_coords = np.argwhere(region_mask & np.isclose(score_map, peak_score))
+        candidates.append(
+            {
+                "label_id": peak_region_id,
+                "seed_mask": region_mask,
+                "peak_score": peak_score,
+                "representative": (int(max_coords[0, 0]), int(max_coords[0, 1])),
+                "plateau_size": int(region_mask.sum()),
+                "peak_labels": peak_labels,
+            }
+        )
 
-    peak_regions.sort(key=lambda item: item[0], reverse=True)
-
-    selected_seed_labels = np.zeros_like(peak_labels, dtype=np.int32)
-    seed_strengths: Dict[int, float] = {}
-    seed_ranks: Dict[int, int] = {}
-    seed_centers: Dict[int, Tuple[int, int]] = {}
-    selected_centers: List[Tuple[float, float]] = []
-    next_seed_id = 1
-
-    for peak_score, peak_region_id in peak_regions:
-        if peak_score < seed_threshold:
-            break
-        if next_seed_id > max_seeds:
-            break
-
-        center_row, center_col = peak_centers[peak_region_id]
-        too_close = False
-        for selected_row, selected_col in selected_centers:
-            chebyshev_distance = max(abs(center_row - selected_row), abs(center_col - selected_col))
-            if chebyshev_distance <= min_seed_distance_patches:
-                too_close = True
-                break
-        if too_close:
-            continue
-
-        selected_seed_labels[peak_labels == peak_region_id] = next_seed_id
-        seed_strengths[next_seed_id] = peak_score
-        seed_ranks[next_seed_id] = next_seed_id
-        seed_centers[next_seed_id] = peak_representatives[peak_region_id]
-        selected_centers.append((center_row, center_col))
-        next_seed_id += 1
-
-    return selected_seed_labels, seed_strengths, seed_ranks, seed_centers
+    candidates.sort(key=lambda candidate: candidate["peak_score"], reverse=True)
+    return candidates
 
 
-def grow_seed_regions(
+def estimate_local_background(
     score_map: np.ndarray,
-    seed_labels: np.ndarray,
-    seed_strengths: Dict[int, float],
-    grow_threshold: float,
+    seed_mask: np.ndarray,
+    available_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    inner_radius: int,
+    outer_radius: int,
+) -> Tuple[float, np.ndarray, str]:
+    outer = binary_dilation(seed_mask, structure=EIGHT_CONNECTED_BOOL, iterations=outer_radius)
+    inner = binary_dilation(seed_mask, structure=EIGHT_CONNECTED_BOOL, iterations=inner_radius)
+    ring_mask = outer & ~inner
+    ring_valid = ring_mask & available_mask & valid_mask
+    if ring_valid.any():
+        return float(np.median(score_map[ring_valid])), ring_valid, "ring"
+
+    fallback_valid = available_mask & valid_mask & ~seed_mask
+    if fallback_valid.any():
+        return float(np.median(score_map[fallback_valid])), ring_valid, "fallback_free"
+
+    return float(np.median(score_map[seed_mask])), ring_valid, "seed_only"
+
+
+def hysteresis_component(
+    score_map: np.ndarray,
+    seed_mask: np.ndarray,
+    available_mask: np.ndarray,
+    high_threshold: float,
+    low_threshold: float,
 ) -> np.ndarray:
-    grow_mask = score_map >= grow_threshold
-    assigned = np.zeros_like(seed_labels, dtype=np.int32)
-    priority_queue: List[Tuple[int, float, int, int, int]] = []
+    strong_mask = available_mask & (score_map >= high_threshold)
+    strong_labels, _ = label(strong_mask.astype(np.uint8), structure=EIGHT_CONNECTED)
+    strong_component_ids = np.unique(strong_labels[seed_mask])
+    strong_component_ids = strong_component_ids[strong_component_ids > 0]
+    if strong_component_ids.size == 0:
+        return seed_mask.copy()
 
-    for seed_id, seed_strength in seed_strengths.items():
-        for row, col in np.argwhere(seed_labels == seed_id):
-            heapq.heappush(priority_queue, (0, -seed_strength, seed_id, int(row), int(col)))
+    strong_component_mask = np.isin(strong_labels, strong_component_ids)
+    weak_mask = available_mask & (score_map >= low_threshold)
+    weak_labels, _ = label(weak_mask.astype(np.uint8), structure=EIGHT_CONNECTED)
+    weak_component_ids = np.unique(weak_labels[strong_component_mask])
+    weak_component_ids = weak_component_ids[weak_component_ids > 0]
+    if weak_component_ids.size == 0:
+        return strong_component_mask
 
-    while priority_queue:
-        distance, neg_seed_strength, seed_id, row, col = heapq.heappop(priority_queue)
-        if assigned[row, col] != 0:
+    return np.isin(weak_labels, weak_component_ids)
+
+
+def region_peak_details(
+    score_map: np.ndarray,
+    available_mask: np.ndarray,
+    region_mask: np.ndarray,
+) -> List[Dict[str, object]]:
+    details: List[Dict[str, object]] = []
+    peak_mask = local_maxima_mask(score_map, available_mask)
+    peak_labels, num_peak_regions = label(peak_mask.astype(np.uint8), structure=EIGHT_CONNECTED)
+
+    for peak_region_id in range(1, num_peak_regions + 1):
+        current_peak_mask = peak_labels == peak_region_id
+        if not np.any(current_peak_mask & region_mask):
             continue
-        if not grow_mask[row, col] and seed_labels[row, col] == 0:
-            continue
+        peak_score = float(score_map[current_peak_mask].max())
+        max_coords = np.argwhere(current_peak_mask & np.isclose(score_map, peak_score))
+        details.append(
+            {
+                "peak_score": peak_score,
+                "row": int(max_coords[0, 0]),
+                "col": int(max_coords[0, 1]),
+                "plateau_size": int(current_peak_mask.sum()),
+            }
+        )
 
-        assigned[row, col] = seed_id
-
-        for row_offset in (-1, 0, 1):
-            for col_offset in (-1, 0, 1):
-                if row_offset == 0 and col_offset == 0:
-                    continue
-                next_row = row + row_offset
-                next_col = col + col_offset
-                if not (0 <= next_row < score_map.shape[0] and 0 <= next_col < score_map.shape[1]):
-                    continue
-                if assigned[next_row, next_col] != 0:
-                    continue
-                if not grow_mask[next_row, next_col]:
-                    continue
-                heapq.heappush(
-                    priority_queue,
-                    (distance + 1, neg_seed_strength, seed_id, next_row, next_col),
-                )
-
-    return assigned
+    details.sort(key=lambda item: item["peak_score"], reverse=True)
+    if not details and np.any(region_mask):
+        masked_scores = np.full(score_map.shape, -np.inf, dtype=np.float32)
+        masked_scores[region_mask] = score_map[region_mask]
+        row, col = np.unravel_index(np.argmax(masked_scores), score_map.shape)
+        details.append(
+            {
+                "peak_score": float(score_map[row, col]),
+                "row": int(row),
+                "col": int(col),
+                "plateau_size": int(region_mask.sum()),
+            }
+        )
+    return details
 
 
 def patch_box_to_image_box(
@@ -253,15 +313,15 @@ def patch_box_to_image_box(
     cropped_w = resized_w - (resized_w % patch_multiple)
     cropped_h = resized_h - (resized_h % patch_multiple)
 
-    x0_processed = math.floor(col_min * cropped_w / grid_w)
-    x1_processed = math.ceil((col_max + 1) * cropped_w / grid_w)
-    y0_processed = math.floor(row_min * cropped_h / grid_h)
-    y1_processed = math.ceil((row_max + 1) * cropped_h / grid_h)
+    processed_x_edges = np.rint(np.linspace(0, cropped_w, grid_w + 1)).astype(int)
+    processed_y_edges = np.rint(np.linspace(0, cropped_h, grid_h + 1)).astype(int)
+    original_x_edges = np.rint(processed_x_edges * orig_w / resized_w).astype(int)
+    original_y_edges = np.rint(processed_y_edges * orig_h / resized_h).astype(int)
 
-    x0 = math.floor(x0_processed * orig_w / resized_w)
-    x1 = math.ceil(x1_processed * orig_w / resized_w)
-    y0 = math.floor(y0_processed * orig_h / resized_h)
-    y1 = math.ceil(y1_processed * orig_h / resized_h)
+    x0 = int(original_x_edges[col_min])
+    x1 = int(original_x_edges[col_max + 1])
+    y0 = int(original_y_edges[row_min])
+    y1 = int(original_y_edges[row_max + 1])
 
     x0 = max(0, min(x0, orig_w - 1))
     y0 = max(0, min(y0, orig_h - 1))
@@ -275,34 +335,40 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def fixed_patch_window(
-    center: Tuple[int, int],
-    grid_shape: Tuple[int, int],
-    crop_size_patches: int,
-) -> Tuple[int, int, int, int]:
-    if crop_size_patches <= 0 or crop_size_patches % 2 == 0:
-        raise ValueError(f"crop_size_patches must be a positive odd number, got {crop_size_patches}")
+def draw_roi_overlay(
+    image: Image.Image,
+    roi_entries: List[Dict[str, object]],
+    output_path: Path,
+) -> None:
+    canvas = image.copy()
+    draw = ImageDraw.Draw(canvas)
+    palette = [
+        "red",
+        "lime",
+        "cyan",
+        "yellow",
+        "magenta",
+        "orange",
+        "deepskyblue",
+        "chartreuse",
+    ]
 
-    center_row, center_col = center
-    grid_h, grid_w = grid_shape
-    crop_h = min(crop_size_patches, grid_h)
-    crop_w = min(crop_size_patches, grid_w)
-    radius_h = crop_h // 2
-    radius_w = crop_w // 2
+    for roi_entry in roi_entries:
+        color = palette[int(roi_entry["roi_index"]) % len(palette)]
+        x0 = int(roi_entry["x_min"])
+        y0 = int(roi_entry["y_min"])
+        x1 = int(roi_entry["x_max"])
+        y1 = int(roi_entry["y_max"])
+        draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=color, width=4)
+        label_text = (
+            f"ROI {int(roi_entry['roi_index']):02d} | "
+            f"peaks={int(roi_entry['peak_count_in_region'])} | "
+            f"max={float(roi_entry['region_max_score']):.3f}"
+        )
+        draw.text((x0 + 6, max(4, y0 - 18)), label_text, fill=color)
 
-    row_min = max(0, center_row - radius_h)
-    row_max = row_min + crop_h - 1
-    if row_max >= grid_h:
-        row_max = grid_h - 1
-        row_min = max(0, row_max - crop_h + 1)
-
-    col_min = max(0, center_col - radius_w)
-    col_max = col_min + crop_w - 1
-    if col_max >= grid_w:
-        col_max = grid_w - 1
-        col_min = max(0, col_max - crop_w + 1)
-
-    return row_min, row_max, col_min, col_max
+    ensure_parent(output_path)
+    canvas.save(output_path)
 
 
 def clear_output_dir(output_dir: Path) -> None:
@@ -322,29 +388,107 @@ def region_box(region_mask: np.ndarray) -> Tuple[int, int, int, int]:
     return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
 
 
-def box_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
+def region_mass(score_map: np.ndarray, region_mask: np.ndarray, background_value: float) -> float:
+    return float(np.clip(score_map[region_mask] - background_value, a_min=0.0, a_max=None).sum())
+
+
+def boxes_overlap(
+    box_a: Tuple[int, int, int, int],
+    box_b: Tuple[int, int, int, int],
+) -> bool:
     a_row_min, a_row_max, a_col_min, a_col_max = box_a
     b_row_min, b_row_max, b_col_min, b_col_max = box_b
+    row_overlap = max(a_row_min, b_row_min) <= min(a_row_max, b_row_max)
+    col_overlap = max(a_col_min, b_col_min) <= min(a_col_max, b_col_max)
+    return row_overlap and col_overlap
 
-    inter_row_min = max(a_row_min, b_row_min)
-    inter_row_max = min(a_row_max, b_row_max)
-    inter_col_min = max(a_col_min, b_col_min)
-    inter_col_max = min(a_col_max, b_col_max)
 
-    if inter_row_min > inter_row_max or inter_col_min > inter_col_max:
-        return 0.0
+def boxes_within_gap(
+    box_a: Tuple[int, int, int, int],
+    box_b: Tuple[int, int, int, int],
+    gap: int,
+) -> bool:
+    a_row_min, a_row_max, a_col_min, a_col_max = box_a
+    b_row_min, b_row_max, b_col_min, b_col_max = box_b
+    row_close = not (a_row_max + gap + 1 < b_row_min or b_row_max + gap + 1 < a_row_min)
+    col_close = not (a_col_max + gap + 1 < b_col_min or b_col_max + gap + 1 < a_col_min)
+    return row_close and col_close
 
-    inter_area = (inter_row_max - inter_row_min + 1) * (inter_col_max - inter_col_min + 1)
-    area_a = (a_row_max - a_row_min + 1) * (a_col_max - a_col_min + 1)
-    area_b = (b_row_max - b_row_min + 1) * (b_col_max - b_col_min + 1)
-    union_area = area_a + area_b - inter_area
-    return inter_area / union_area if union_area > 0 else 0.0
+
+def merge_without_valley(
+    score_map: np.ndarray,
+    valid_mask: np.ndarray,
+    region_a: np.ndarray,
+    box_a: Tuple[int, int, int, int],
+    background_a: float,
+    prominence_a: float,
+    region_b: np.ndarray,
+    box_b: Tuple[int, int, int, int],
+    background_b: float,
+    prominence_b: float,
+    gap: int,
+    bridge_ratio: float,
+) -> bool:
+    if not boxes_within_gap(box_a, box_b, gap):
+        return False
+
+    bridge_threshold = max(background_a, background_b) + bridge_ratio * min(prominence_a, prominence_b)
+    row_min = max(0, min(box_a[0], box_b[0]) - gap - 1)
+    row_max = min(score_map.shape[0] - 1, max(box_a[1], box_b[1]) + gap + 1)
+    col_min = max(0, min(box_a[2], box_b[2]) - gap - 1)
+    col_max = min(score_map.shape[1] - 1, max(box_a[3], box_b[3]) + gap + 1)
+
+    local_scores = score_map[row_min : row_max + 1, col_min : col_max + 1]
+    local_valid = valid_mask[row_min : row_max + 1, col_min : col_max + 1]
+    local_region_a = region_a[row_min : row_max + 1, col_min : col_max + 1]
+    local_region_b = region_b[row_min : row_max + 1, col_min : col_max + 1]
+    bridge_mask = local_valid & (local_scores >= bridge_threshold)
+    if not np.any(local_region_a & bridge_mask) or not np.any(local_region_b & bridge_mask):
+        return False
+
+    bridge_labels, _ = label(bridge_mask.astype(np.uint8), structure=EIGHT_CONNECTED)
+    component_ids_a = np.unique(bridge_labels[local_region_a & bridge_mask])
+    component_ids_b = np.unique(bridge_labels[local_region_b & bridge_mask])
+    component_ids_a = component_ids_a[component_ids_a > 0]
+    component_ids_b = component_ids_b[component_ids_b > 0]
+    if component_ids_a.size == 0 or component_ids_b.size == 0:
+        return False
+    return np.intersect1d(component_ids_a, component_ids_b).size > 0
+
+
+def strength_key(score_map: np.ndarray, accepted_region: Dict[str, object]) -> Tuple[float, float, float, int]:
+    return (
+        float(score_map[accepted_region["region_mask"]].max()),
+        region_mass(
+            score_map,
+            accepted_region["region_mask"],
+            float(accepted_region["background_value"]),
+        ),
+        float(accepted_region["prominence"]),
+        int(accepted_region["region_mask"].sum()),
+    )
 
 
 def main():
     args = parse_args()
     experiment_dir = args.experiment_dir.resolve()
     run_args = load_run_args(experiment_dir)
+    if args.background_ring_inner < 0 or args.background_ring_outer <= args.background_ring_inner:
+        raise ValueError("background ring must satisfy 0 <= inner < outer")
+    if not (0.0 <= args.low_prominence_ratio <= args.high_prominence_ratio <= 1.0):
+        raise ValueError("Prominence ratios must satisfy 0 <= low <= high <= 1")
+    if args.min_region_patches < 1:
+        raise ValueError("min_region_patches must be at least 1")
+    if args.min_prominence < 0:
+        raise ValueError("min_prominence must be non-negative")
+    if args.min_region_mass < 0:
+        raise ValueError("min_region_mass must be non-negative")
+    if args.merge_gap_patches < 0:
+        raise ValueError("merge_gap_patches must be non-negative")
+    if not (0.0 <= args.merge_bridge_ratio <= 1.0):
+        raise ValueError("merge_bridge_ratio must satisfy 0 <= ratio <= 1")
+    if args.max_boxes_per_image is not None and args.max_boxes_per_image < 1:
+        raise ValueError("max_boxes_per_image must be at least 1 when provided")
 
     measurements = load_measurements(experiment_dir / f"measurements_seed={args.seed}.csv")
     anomaly_maps_root = experiment_dir / "anomaly_maps" / f"seed={args.seed}"
@@ -354,9 +498,12 @@ def main():
     data_root = Path(run_args["data_root"])
     patch_multiple = infer_patch_multiple(str(run_args["model_name"]))
     resolution = int(run_args["resolution"])
-    output_dir = args.output_dir or (experiment_dir / "roi_crops_peak_seeds" / f"seed={args.seed}")
+    output_dir = args.output_dir or (experiment_dir / "roi_crops_peak_hysteresis" / f"seed={args.seed}")
     output_dir.mkdir(parents=True, exist_ok=True)
     clear_output_dir(output_dir)
+    overlay_dir = output_dir / "overlay_images"
+    if args.save_overlay_images:
+        overlay_dir.mkdir(parents=True, exist_ok=True)
 
     metadata_rows: List[Dict[str, object]] = []
     exported_rois = 0
@@ -385,22 +532,10 @@ def main():
             continue
 
         d_masked = np.load(npy_file)
-        seed_threshold = threshold
-        grow_threshold = args.grow_threshold_ratio * seed_threshold
-        if grow_threshold > seed_threshold:
-            raise ValueError(
-                f"grow_threshold_ratio must produce a threshold <= seed threshold, got {grow_threshold} > {seed_threshold}"
-            )
-
-        seed_labels, seed_strengths, seed_ranks, seed_centers = build_peak_seed_regions(
-            d_masked,
-            seed_threshold,
-            max_seeds=args.max_seeds,
-            min_seed_distance_patches=args.min_seed_distance_patches,
-        )
-        if not seed_strengths:
-            continue
-        assigned_regions = grow_seed_regions(d_masked, seed_labels, seed_strengths, grow_threshold)
+        valid_mask = d_masked > 0.0
+        consumed_mask = np.zeros_like(valid_mask, dtype=bool)
+        rejected_mask = np.zeros_like(valid_mask, dtype=bool)
+        box_blocked_mask = np.zeros_like(valid_mask, dtype=bool)
 
         sample_rel_path = Path(row["Sample"].replace("\\", "/"))
         image_path = data_root / object_name / split_name / sample_rel_path
@@ -414,85 +549,206 @@ def main():
             resized = resized_image_for_dinov2(image, resolution)
             resized_size = resized.size
 
-            roi_index = 0
-            accepted_patch_boxes: List[Tuple[int, int, int, int]] = []
-            for seed_id in sorted(seed_strengths):
-                region_mask = assigned_regions == seed_id
-                if not region_mask.any():
+            accepted_regions: List[Dict[str, object]] = []
+            while True:
+                available_mask = valid_mask & ~consumed_mask & ~rejected_mask & ~box_blocked_mask
+                peak_candidates_current = peak_candidates(d_masked, available_mask)
+                if not peak_candidates_current:
+                    break
+
+                best_candidate = peak_candidates_current[0]
+                peak_score = float(best_candidate["peak_score"])
+                if peak_score < threshold:
+                    break
+
+                seed_mask = best_candidate["seed_mask"]
+                background_value, ring_mask, background_source = estimate_local_background(
+                    d_masked,
+                    seed_mask,
+                    available_mask=available_mask,
+                    valid_mask=valid_mask,
+                    inner_radius=args.background_ring_inner,
+                    outer_radius=args.background_ring_outer,
+                )
+                prominence = peak_score - background_value
+                if prominence < args.min_prominence:
+                    rejected_mask |= seed_mask
+                    continue
+
+                high_threshold = background_value + args.high_prominence_ratio * prominence
+                low_threshold = background_value + args.low_prominence_ratio * prominence
+                region_mask = hysteresis_component(
+                    d_masked,
+                    seed_mask=seed_mask,
+                    available_mask=available_mask,
+                    high_threshold=high_threshold,
+                    low_threshold=low_threshold,
+                )
+                if int(region_mask.sum()) < args.min_region_patches:
+                    rejected_mask |= region_mask
+                    continue
+
+                region_max_score = float(d_masked[region_mask].max())
+                if region_max_score < threshold:
+                    rejected_mask |= region_mask
+                    continue
+
+                current_region_mass = region_mass(d_masked, region_mask, background_value)
+                if current_region_mass < args.min_region_mass:
+                    rejected_mask |= region_mask
                     continue
 
                 region_row_min, region_row_max, region_col_min, region_col_max = region_box(region_mask)
-                crop_patch_box = fixed_patch_window(
-                    seed_centers[seed_id],
-                    d_masked.shape,
-                    crop_size_patches=args.crop_size_patches,
-                )
+                crop_patch_box = (region_row_min, region_row_max, region_col_min, region_col_max)
+                consumed_mask |= region_mask
+                merged_mask = region_mask.copy()
+                merged_summary = {
+                    "background_source": background_source,
+                    "background_value": background_value,
+                    "prominence": prominence,
+                    "high_threshold": high_threshold,
+                    "low_threshold": low_threshold,
+                    "ring_patch_count": int(ring_mask.sum()),
+                    "proposal_count": 1,
+                }
 
-                if any(box_iou(crop_patch_box, accepted_box) >= args.overlap_iou_threshold for accepted_box in accepted_patch_boxes):
-                    continue
+                changed = True
+                while changed:
+                    changed = False
+                    merged_box = region_box(merged_mask)
+                    remaining_regions: List[Dict[str, object]] = []
+                    for accepted_region in accepted_regions:
+                        if merge_without_valley(
+                            score_map=d_masked,
+                            valid_mask=valid_mask,
+                            region_a=merged_mask,
+                            box_a=merged_box,
+                            background_a=float(merged_summary["background_value"]),
+                            prominence_a=float(merged_summary["prominence"]),
+                            region_b=accepted_region["region_mask"],
+                            box_b=accepted_region["patch_box"],
+                            background_b=float(accepted_region["background_value"]),
+                            prominence_b=float(accepted_region["prominence"]),
+                            gap=args.merge_gap_patches,
+                            bridge_ratio=args.merge_bridge_ratio,
+                        ):
+                            merged_mask |= accepted_region["region_mask"]
+                            merged_summary["proposal_count"] += int(accepted_region["proposal_count"])
+                            if float(accepted_region["prominence"]) > float(merged_summary["prominence"]):
+                                merged_summary["background_source"] = accepted_region["background_source"]
+                                merged_summary["background_value"] = accepted_region["background_value"]
+                                merged_summary["prominence"] = accepted_region["prominence"]
+                                merged_summary["high_threshold"] = accepted_region["high_threshold"]
+                                merged_summary["low_threshold"] = accepted_region["low_threshold"]
+                                merged_summary["ring_patch_count"] = accepted_region["ring_patch_count"]
+                            changed = True
+                        else:
+                            remaining_regions.append(accepted_region)
+                    accepted_regions = remaining_regions
 
-                row_min, row_max, col_min, col_max = crop_patch_box
-                x0, y0, x1, y1 = patch_box_to_image_box(
-                    crop_patch_box,
-                    d_masked.shape,
-                    original_size,
-                    resized_size,
-                    patch_multiple=patch_multiple,
-                )
-
-                crop = image.crop((x0, y0, x1, y1))
-                roi_path = output_dir / object_name / split_name / sample_rel_path.parent / (
-                    f"{sample_rel_path.stem}__roi_{roi_index:02d}.png"
-                )
-                ensure_parent(roi_path)
-                crop.save(roi_path)
-                accepted_patch_boxes.append(crop_patch_box)
-
-                component_scores = d_masked[region_mask]
-                seed_mask = seed_labels == seed_id
-                metadata_rows.append(
+                merged_box = region_box(merged_mask)
+                accepted_regions.append(
                     {
+                        "region_mask": merged_mask,
+                        "patch_box": merged_box,
+                        **merged_summary,
+                    }
+                )
+                if args.block_boxes:
+                    region_row_min, region_row_max, region_col_min, region_col_max = merged_box
+                    box_blocked_mask[region_row_min : region_row_max + 1, region_col_min : region_col_max + 1] = True
+
+            if accepted_regions:
+                accepted_regions.sort(key=lambda accepted_region: strength_key(d_masked, accepted_region), reverse=True)
+                non_overlapping_regions: List[Dict[str, object]] = []
+                for accepted_region in accepted_regions:
+                    if any(
+                        boxes_overlap(accepted_region["patch_box"], kept_region["patch_box"])
+                        for kept_region in non_overlapping_regions
+                    ):
+                        continue
+                    non_overlapping_regions.append(accepted_region)
+                accepted_regions = non_overlapping_regions
+                if args.max_boxes_per_image is not None:
+                    accepted_regions = accepted_regions[: args.max_boxes_per_image]
+                image_overlay_rows: List[Dict[str, object]] = []
+                for roi_index, accepted_region in enumerate(accepted_regions):
+                    merged_mask = accepted_region["region_mask"]
+                    region_row_min, region_row_max, region_col_min, region_col_max = accepted_region["patch_box"]
+                    crop_patch_box = (region_row_min, region_row_max, region_col_min, region_col_max)
+                    x0, y0, x1, y1 = patch_box_to_image_box(
+                        crop_patch_box,
+                        d_masked.shape,
+                        original_size,
+                        resized_size,
+                        patch_multiple=patch_multiple,
+                    )
+
+                    crop = image.crop((x0, y0, x1, y1))
+                    roi_path = output_dir / object_name / split_name / sample_rel_path.parent / (
+                        f"{sample_rel_path.stem}__roi_{roi_index:02d}.png"
+                    )
+                    ensure_parent(roi_path)
+                    crop.save(roi_path)
+
+                    peaks_in_region = region_peak_details(d_masked, available_mask=valid_mask, region_mask=merged_mask)
+                    primary_peak = peaks_in_region[0]
+                    final_region_mass = region_mass(d_masked, merged_mask, float(accepted_region["background_value"]))
+                    roi_metadata = {
                         "object": object_name,
                         "split": split_name,
                         "sample": row["Sample"],
                         "roi_index": roi_index,
-                        "seed_threshold": seed_threshold,
-                        "grow_threshold": grow_threshold,
-                        "min_seed_distance_patches": args.min_seed_distance_patches,
-                        "crop_size_patches": args.crop_size_patches,
-                        "overlap_iou_threshold": args.overlap_iou_threshold,
+                        "image_threshold": threshold,
                         "image_score": image_score,
-                        "seed_id": seed_id,
-                        "seed_rank": seed_ranks[seed_id],
-                        "seed_max_score": seed_strengths[seed_id],
-                        "seed_center_row": seed_centers[seed_id][0],
-                        "seed_center_col": seed_centers[seed_id][1],
-                        "roi_max_score": float(component_scores.max()),
-                        "roi_mean_score": float(component_scores.mean()),
-                        "region_patch_count": int(region_mask.sum()),
-                        "seed_patch_count": int(seed_mask.sum()),
+                        "background_ring_inner": args.background_ring_inner,
+                        "background_ring_outer": args.background_ring_outer,
+                        "background_source": accepted_region["background_source"],
+                        "background_value": accepted_region["background_value"],
+                        "prominence": accepted_region["prominence"],
+                        "min_prominence": args.min_prominence,
+                        "high_threshold": accepted_region["high_threshold"],
+                        "low_threshold": accepted_region["low_threshold"],
+                        "region_mass": final_region_mass,
+                        "min_region_mass": args.min_region_mass,
+                        "merged_proposal_count": int(accepted_region["proposal_count"]),
+                        "merge_gap_patches": args.merge_gap_patches,
+                        "merge_bridge_ratio": args.merge_bridge_ratio,
+                        "max_boxes_per_image": args.max_boxes_per_image if args.max_boxes_per_image is not None else "",
+                        "primary_peak_score": primary_peak["peak_score"],
+                        "primary_peak_row": primary_peak["row"],
+                        "primary_peak_col": primary_peak["col"],
+                        "primary_peak_plateau_size": primary_peak["plateau_size"],
+                        "peak_count_in_region": len(peaks_in_region),
+                        "peak_rows": ";".join(str(peak["row"]) for peak in peaks_in_region),
+                        "peak_cols": ";".join(str(peak["col"]) for peak in peaks_in_region),
+                        "peak_scores": ";".join(f"{peak['peak_score']:.6f}" for peak in peaks_in_region),
+                        "peak_plateau_sizes": ";".join(str(peak["plateau_size"]) for peak in peaks_in_region),
+                        "region_patch_count": int(merged_mask.sum()),
+                        "region_max_score": float(d_masked[merged_mask].max()),
+                        "region_mean_score": float(d_masked[merged_mask].mean()),
                         "region_row_min": int(region_row_min),
                         "region_row_max": int(region_row_max),
                         "region_col_min": int(region_col_min),
                         "region_col_max": int(region_col_max),
-                        "crop_patch_row_min": int(row_min),
-                        "crop_patch_row_max": int(row_max),
-                        "crop_patch_col_min": int(col_min),
-                        "crop_patch_col_max": int(col_max),
+                        "ring_patch_count": int(accepted_region["ring_patch_count"]),
                         "x_min": x0,
                         "y_min": y0,
                         "x_max": x1,
                         "y_max": y1,
                         "crop_path": str(roi_path),
                     }
-                )
+                    metadata_rows.append(roi_metadata)
+                    image_overlay_rows.append(roi_metadata)
+                    exported_rois += 1
 
-                roi_index += 1
-                exported_rois += 1
-
-            if roi_index > 0:
+                if args.save_overlay_images:
+                    overlay_path = overlay_dir / object_name / split_name / sample_rel_path.parent / (
+                        f"{sample_rel_path.stem}__overlay.png"
+                    )
+                    draw_roi_overlay(image, image_overlay_rows, overlay_path)
                 processed_images += 1
-                print(f"Exported {roi_index} ROI(s) for {row['Sample']}")
+                print(f"Exported {len(accepted_regions)} ROI(s) for {row['Sample']}")
 
     metadata_file = output_dir / "roi_metadata.csv"
     with metadata_file.open("w", newline="", encoding="utf-8") as handle:

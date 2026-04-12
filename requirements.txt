@@ -14,3 +14,5 @@ PyYAML
 pandas
 transformers
 huggingface_hub
+segment-anything-hq
+timm

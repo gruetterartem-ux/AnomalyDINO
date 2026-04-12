@@ -8,4 +8,8 @@ paper_tables*/
 results*/
 *personal.ipynb
 feature_extraction.ipynb
+__pycache__/
+*.py[cod]
+checkpoints/
+reference_search_normalmap*/
 src/__pycache__/
