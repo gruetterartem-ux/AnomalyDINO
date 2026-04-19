@@ -12,6 +12,8 @@ tifffile
 argparse
 PyYAML
 pandas
+streamlit
+streamlit-image-coordinates
 transformers
 huggingface_hub
 segment-anything-hq

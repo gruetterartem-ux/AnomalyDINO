@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="MVTec")
     parser.add_argument("--data_root", type=str, default="data/mvtec_anomaly_detection")
     parser.add_argument("--model_size", type=str, default="s")
+    parser.add_argument("--model_name", type=str, default=None, help="Optional explicit backbone model, e.g. dinov2_vitb14 or dinov3_vitb16.")
+    parser.add_argument("--backbone_weights", type=str, default=None, help="Optional local checkpoint path for the backbone.")
     parser.add_argument("--resolution", type=int, default=448)
     parser.add_argument("--preprocess", type=str, default="masking_only")
     parser.add_argument("--save_examples", default=True)
@@ -163,8 +165,9 @@ if __name__=="__main__":
     # set torch device
     torch.cuda.set_device(args.device)
 
-    args.model_name = "dinov2_vit" + args.model_size.lower() + "14"
-    model = get_model(args.model_name, args.device, smaller_edge_size=args.resolution)
+    if args.model_name is None:
+        args.model_name = "dinov2_vit" + args.model_size.lower() + "14"
+    model = get_model(args.model_name, args.device, smaller_edge_size=args.resolution, weights_path=args.backbone_weights)
     dataset = args.dataset
     objects, object_anomalies, masking_default, rotation_default = get_dataset_info(args.dataset, args.preprocess)
 

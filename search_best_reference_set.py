@@ -13,7 +13,7 @@ from numpy.lib.format import open_memmap
 
 from src.backbones import get_model
 from src.post_eval import eval_classification_scores
-from src.utils import list_image_files
+from src.utils import dists2map, list_image_files
 
 
 DEFAULT_DATA_ROOT = Path(r"C:\anomalydino_data_single_object_normalmap")
@@ -40,14 +40,26 @@ def parse_args():
         "--model-name",
         type=str,
         default="dinov2_vitb14",
-        choices=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"],
-        help="Backbone model.",
+        help="Backbone model, e.g. dinov2_vitb14 or dinov3_vitb16.",
+    )
+    parser.add_argument(
+        "--backbone-weights",
+        type=Path,
+        default=None,
+        help="Optional local checkpoint path for the backbone.",
     )
     parser.add_argument(
         "--resolution",
         type=int,
         default=704,
         help="Smaller edge size passed to DINOv2.",
+    )
+    parser.add_argument(
+        "--aggregation-statistics",
+        type=str,
+        default="max_patch_distance",
+        choices=["max_patch_distance", "max_anomaly_map"],
+        help="Image-level aggregation used during reference search.",
     )
     parser.add_argument(
         "--device",
@@ -222,6 +234,7 @@ def build_feature_cache(
     model_name: str,
     device: str,
     resolution: int,
+    backbone_weights: Path | None,
     force_recompute: bool,
     row_name: str,
 ) -> Tuple[Path, int, int]:
@@ -236,7 +249,12 @@ def build_feature_cache(
             return cache_path, int(shape_info["patch_count"]), int(shape_info["feature_dim"])
 
     ensure_dir(cache_path.parent)
-    model = get_model(model_name, device, smaller_edge_size=resolution)
+    model = get_model(
+        model_name,
+        device,
+        smaller_edge_size=resolution,
+        weights_path=None if backbone_weights is None else str(backbone_weights),
+    )
 
     patch_count = None
     feature_dim = None
@@ -369,10 +387,54 @@ def metrics_key(entry: Dict[str, object]) -> Tuple[float, float, float]:
     return (float(entry["f1"]), float(entry["ap"]), float(entry["auroc"]))
 
 
-def evaluate_subset(dist_cache: np.ndarray, labels: np.ndarray, subset: Sequence[int]) -> Dict[str, object]:
+def infer_common_test_image_geometry(
+    test_rows: List[Dict[str, object]],
+    model_name: str,
+    device: str,
+    resolution: int,
+    backbone_weights: Path | None,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    model = get_model(
+        model_name,
+        device,
+        smaller_edge_size=resolution,
+        weights_path=None if backbone_weights is None else str(backbone_weights),
+    )
+    image_tensor, grid_size = model.prepare_image(test_rows[0]["path"])
+    image_hw = (int(image_tensor.shape[1]), int(image_tensor.shape[2]))
+    return grid_size, image_hw
+
+
+def scores_from_min_map(
+    min_map: np.ndarray,
+    aggregation_statistics: str,
+    grid_size: Tuple[int, int],
+    image_hw: Tuple[int, int],
+) -> np.ndarray:
+    if aggregation_statistics == "max_patch_distance":
+        return np.max(min_map, axis=1)
+    if aggregation_statistics == "max_anomaly_map":
+        grid_h, grid_w = grid_size
+        reshaped = min_map.reshape(min_map.shape[0], grid_h, grid_w)
+        img_shape = (image_hw[0], image_hw[1], 3)
+        scores = np.empty(reshaped.shape[0], dtype=np.float32)
+        for idx in range(reshaped.shape[0]):
+            scores[idx] = float(np.max(dists2map(reshaped[idx], img_shape)))
+        return scores
+    raise ValueError(f"Unsupported aggregation_statistics: {aggregation_statistics}")
+
+
+def evaluate_subset(
+    dist_cache: np.ndarray,
+    labels: np.ndarray,
+    subset: Sequence[int],
+    aggregation_statistics: str,
+    grid_size: Tuple[int, int],
+    image_hw: Tuple[int, int],
+) -> Dict[str, object]:
     subset = tuple(sorted(subset))
     min_map = np.min(dist_cache[:, :, subset], axis=2)
-    scores = np.max(min_map, axis=1)
+    scores = scores_from_min_map(min_map, aggregation_statistics, grid_size, image_hw)
     metrics = metrics_from_scores(labels, scores)
     return {
         "subset": subset,
@@ -412,21 +474,21 @@ def beam_search(
     seed_pool: List[Dict[str, object]],
     target_shot: int,
     beam_width: int,
+    aggregation_statistics: str,
+    grid_size: Tuple[int, int],
+    image_hw: Tuple[int, int],
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     beam = []
     for entry in seed_pool[:beam_width]:
         beam.append(
-            {
-                "subset": entry["subset"],
-                "min_map": dist_cache[:, :, entry["subset"][0]].copy(),
-                "scores": np.max(dist_cache[:, :, entry["subset"][0]], axis=1),
-                "f1": entry["f1"],
-                "ap": entry["ap"],
-                "auroc": entry["auroc"],
-                "threshold": entry["threshold"],
-                "precision": entry["precision"],
-                "recall": entry["recall"],
-            }
+            evaluate_subset(
+                dist_cache,
+                labels,
+                entry["subset"],
+                aggregation_statistics,
+                grid_size,
+                image_hw,
+            )
         )
 
     all_stage_best = []
@@ -444,13 +506,23 @@ def beam_search(
                     continue
                 seen_subsets.add(subset)
                 new_min_map = np.minimum(state["min_map"], dist_cache[:, :, ref_idx])
-                new_scores = np.max(new_min_map, axis=1)
+                new_scores = scores_from_min_map(new_min_map, aggregation_statistics, grid_size, image_hw)
                 metrics = metrics_from_scores(labels, new_scores)
                 candidate_records.append({"subset": subset, **metrics})
 
         candidate_records.sort(key=metrics_key, reverse=True)
         kept_records = candidate_records[:beam_width]
-        beam = [evaluate_subset(dist_cache, labels, entry["subset"]) for entry in kept_records]
+        beam = [
+            evaluate_subset(
+                dist_cache,
+                labels,
+                entry["subset"],
+                aggregation_statistics,
+                grid_size,
+                image_hw,
+            )
+            for entry in kept_records
+        ]
         all_stage_best.extend(beam)
         best = beam[0]
         print(
@@ -464,6 +536,9 @@ def local_swap_search(
     dist_cache: np.ndarray,
     labels: np.ndarray,
     start_state: Dict[str, object],
+    aggregation_statistics: str,
+    grid_size: Tuple[int, int],
+    image_hw: Tuple[int, int],
 ) -> Dict[str, object]:
     best_state = start_state
     n_train = dist_cache.shape[2]
@@ -477,7 +552,14 @@ def local_swap_search(
                 if add_idx in current_subset:
                     continue
                 candidate_subset = tuple(sorted((*remaining, add_idx)))
-                candidate_state = evaluate_subset(dist_cache, labels, candidate_subset)
+                candidate_state = evaluate_subset(
+                    dist_cache,
+                    labels,
+                    candidate_subset,
+                    aggregation_statistics,
+                    grid_size,
+                    image_hw,
+                )
                 if metrics_key(candidate_state) > metrics_key(best_state):
                     best_state = candidate_state
                     improved = True
@@ -496,10 +578,20 @@ def exhaustive_pool_search(
     labels: np.ndarray,
     pool_indices: Sequence[int],
     target_shot: int,
+    aggregation_statistics: str,
+    grid_size: Tuple[int, int],
+    image_hw: Tuple[int, int],
 ) -> List[Dict[str, object]]:
     results = []
     for combo in itertools.combinations(sorted(pool_indices), target_shot):
-        state = evaluate_subset(dist_cache, labels, combo)
+        state = evaluate_subset(
+            dist_cache,
+            labels,
+            combo,
+            aggregation_statistics,
+            grid_size,
+            image_hw,
+        )
         results.append(
             {
                 "subset": state["subset"],
@@ -555,6 +647,7 @@ def main():
         model_name=args.model_name,
         device=args.device,
         resolution=args.resolution,
+        backbone_weights=args.backbone_weights,
         force_recompute=args.force_recompute_features,
         row_name="train",
     )
@@ -564,6 +657,7 @@ def main():
         model_name=args.model_name,
         device=args.device,
         resolution=args.resolution,
+        backbone_weights=args.backbone_weights,
         force_recompute=args.force_recompute_features,
         row_name="test",
     )
@@ -571,6 +665,19 @@ def main():
         raise ValueError(
             f"Patch/feature mismatch between train and test caches: "
             f"train={(train_patch_count, feature_dim)} test={(test_patch_count, test_feature_dim)}"
+        )
+
+    grid_size, image_hw = infer_common_test_image_geometry(
+        test_rows=test_rows,
+        model_name=args.model_name,
+        device=args.device,
+        resolution=args.resolution,
+        backbone_weights=args.backbone_weights,
+    )
+    if grid_size[0] * grid_size[1] != train_patch_count:
+        raise ValueError(
+            f"Grid size {grid_size} implies {grid_size[0] * grid_size[1]} patches, "
+            f"but the cache expects {train_patch_count}."
         )
 
     check_time_budget(start_time, args.time_budget_hours, "feature_cache")
@@ -593,13 +700,18 @@ def main():
         return
 
     dist_cache = np.load(dist_cache_path, mmap_mode="r")
-    single_scores = np.max(dist_cache, axis=1)  # n_test x n_train
 
     single_results = []
-    for ref_idx in range(single_scores.shape[1]):
-        scores = np.asarray(single_scores[:, ref_idx], dtype=np.float32)
-        metrics = metrics_from_scores(labels, scores)
-        single_results.append({"subset": (ref_idx,), **metrics})
+    for ref_idx in range(dist_cache.shape[2]):
+        state = evaluate_subset(
+            dist_cache,
+            labels,
+            (ref_idx,),
+            args.aggregation_statistics,
+            grid_size,
+            image_hw,
+        )
+        single_results.append({"subset": (ref_idx,), **metrics_from_scores(labels, np.asarray(state["scores"], dtype=np.float32))})
 
     single_results.sort(key=metrics_key, reverse=True)
     save_single_reference_scores(output_dir / "single_reference_scores.csv", single_results, train_rows)
@@ -616,9 +728,19 @@ def main():
         seed_pool=seed_pool,
         target_shot=args.target_shot,
         beam_width=args.beam_width,
+        aggregation_statistics=args.aggregation_statistics,
+        grid_size=grid_size,
+        image_hw=image_hw,
     )
     best_state = beam[0]
-    best_state = local_swap_search(dist_cache, labels, best_state)
+    best_state = local_swap_search(
+        dist_cache,
+        labels,
+        best_state,
+        args.aggregation_statistics,
+        grid_size,
+        image_hw,
+    )
 
     exhaustive_results = []
     if args.exhaustive_pool_size >= args.target_shot:
@@ -634,9 +756,19 @@ def main():
             labels=labels,
             pool_indices=pool_indices,
             target_shot=args.target_shot,
+            aggregation_statistics=args.aggregation_statistics,
+            grid_size=grid_size,
+            image_hw=image_hw,
         )
         if exhaustive_results and metrics_key(exhaustive_results[0]) > metrics_key(best_state):
-            best_state = evaluate_subset(dist_cache, labels, exhaustive_results[0]["subset"])
+            best_state = evaluate_subset(
+                dist_cache,
+                labels,
+                exhaustive_results[0]["subset"],
+                args.aggregation_statistics,
+                grid_size,
+                image_hw,
+            )
             print(
                 f"Exhaustive reduced-pool search improved best subset to {best_state['subset']} "
                 f"with f1={best_state['f1']:.6f}"
@@ -650,6 +782,9 @@ def main():
         "patch_count": int(train_patch_count),
         "feature_dim": int(feature_dim),
         "target_shot": args.target_shot,
+        "aggregation_statistics": args.aggregation_statistics,
+        "grid_size": list(grid_size),
+        "image_hw": list(image_hw),
         "best_subset_indices": list(best_state["subset"]),
         "best_subset_image_names": named_subset(train_rows, best_state["subset"]),
         "best_f1": float(best_state["f1"]),

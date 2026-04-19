@@ -205,7 +205,22 @@ def resolve_original_image_path(
     object_name = roi_row["object"]
     split = roi_row["split"]
     sample = normalize_sample_path(roi_row["sample"])
-    image_path = data_root / object_name / split / Path(sample)
+    sample_path = Path(sample)
+    if split == "custom_eval":
+        if sample.startswith("good_train_remaining/"):
+            image_path = data_root / object_name / "train" / "good" / sample_path.relative_to("good_train_remaining")
+        elif sample.startswith("good_test/"):
+            image_path = data_root / object_name / "test" / "good" / sample_path.relative_to("good_test")
+        elif sample.startswith("test/bad/"):
+            image_path = data_root / object_name / "test" / "bad" / sample_path.relative_to("test/bad")
+        elif sample.startswith("test/good/"):
+            image_path = data_root / object_name / "test" / "good" / sample_path.relative_to("test/good")
+        else:
+            raise FileNotFoundError(
+                f"Could not resolve custom_eval sample {sample!r} for object {object_name!r}."
+            )
+    else:
+        image_path = data_root / object_name / split / sample_path
     if not image_path.exists():
         raise FileNotFoundError(f"Original image not found: {image_path}")
     return image_path

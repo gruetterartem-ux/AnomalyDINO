@@ -89,7 +89,9 @@ def get_processed_rgb_for_display(model, rgb_image):
 
 def get_resize_and_crop_info(model, rgb_image):
     original_height, original_width = rgb_image.shape[:2]
-    if not model.model_name.startswith("dinov2"):
+    patch_size = getattr(model, "patch_size", None)
+    resize_transform = getattr(model, "resize_transform", None)
+    if patch_size is None or resize_transform is None:
         return {
             "original_height": int(original_height),
             "original_width": int(original_width),
@@ -97,15 +99,13 @@ def get_resize_and_crop_info(model, rgb_image):
             "resized_width": int(original_width),
             "processed_height": int(original_height),
             "processed_width": int(original_width),
-            "patch_size": None,
+            "patch_size": patch_size,
             "processed_rgb": rgb_image.copy(),
         }
 
     pil_image = Image.fromarray(rgb_image)
-    resize_transform = model.transform.transforms[0]
     resized = resize_transform(pil_image)
     resized_rgb = np.array(resized)
-    patch_size = model.model.patch_size
     crop_h = resized_rgb.shape[0] - resized_rgb.shape[0] % patch_size
     crop_w = resized_rgb.shape[1] - resized_rgb.shape[1] % patch_size
     return {
@@ -301,8 +301,8 @@ def resolve_patch_coordinates(cli_args, model, sample_rgb, grid_size):
     else:
         if cli_args.x is None or cli_args.y is None:
             raise ValueError("Both --x and --y are required together.")
-        if not model.model_name.startswith("dinov2"):
-            raise NotImplementedError("Original-image x/y lookup is currently implemented for DINOv2 runs only.")
+        if geometry["patch_size"] is None:
+            raise NotImplementedError("Original-image x/y lookup is currently implemented for dense patch backbones only.")
 
         original_x = int(cli_args.x)
         original_y = int(cli_args.y)

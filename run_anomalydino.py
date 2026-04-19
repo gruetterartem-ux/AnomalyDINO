@@ -29,7 +29,22 @@ class IntListAction(Action):
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, default="MVTec")
-    parser.add_argument("--model_name", type=str, default="dinov2_vits14", help="Name of the backbone model. Choose from ['dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14', 'vit_b_16'].")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="dinov2_vits14",
+        help=(
+            "Name of the backbone model. Examples: "
+            "dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14, "
+            "dinov3_vits16, dinov3_vitsplus16, dinov3_vitb16, dinov3_vitl16, dinov3_vithplus16, vit_b_16."
+        ),
+    )
+    parser.add_argument(
+        "--backbone_weights",
+        type=str,
+        default=None,
+        help="Optional local checkpoint path for the backbone. Useful for DINOv3 without auto-download.",
+    )
     parser.add_argument("--data_root", type=str, default="data/mvtec_anomaly_detection",
                         help="Path to the root directory of the dataset.")
     parser.add_argument("--preprocess", type=str, default="agnostic",
@@ -62,6 +77,8 @@ def parse_args():
                         help="Dataset split to run inference on.")
     parser.add_argument("--eval_remaining_train_good", default=False, action=argparse.BooleanOptionalAction,
                         help="Evaluate on remaining train/good images plus test/good and test anomalies, excluding the selected reference images.")
+    parser.add_argument("--save_patch_feature_cache", default=False, action=argparse.BooleanOptionalAction,
+                        help="Persist per-image backbone patch features during inference for later ROI/classifier reuse.")
     parser.add_argument("--device", default='cuda:0')
     parser.add_argument("--warmup_iters", type=int, default=25, help="Number of warmup iterations, relevant when benchmarking inference time.")
 
@@ -82,11 +99,11 @@ if __name__=="__main__":
 
     # set CUDA device
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device[-1])
-    model = get_model(args.model_name, 'cuda', smaller_edge_size=args.resolution)
+    model = get_model(args.model_name, 'cuda', smaller_edge_size=args.resolution, weights_path=args.backbone_weights)
 
-    if not args.model_name.startswith("dinov2"):
+    if not args.model_name.startswith(("dinov2", "dinov3")):
         masking_default = {o: False for o in objects}
-        print("Caution: Only DINOv2 supports 0-shot masking (for now)!")
+        print("Caution: 0-shot masking is currently implemented only for DINOv2/DINOv3 backbones.")
 
     if args.just_seed != None:
         seeds = [args.just_seed]
@@ -162,6 +179,7 @@ if __name__=="__main__":
                                                                                 aggregation_statistics = args.aggregation_statistics,
                                                                                 inference_split = args.inference_split,
                                                                                 eval_remaining_train_good = args.eval_remaining_train_good,
+                                                                                feature_cache_dir = (results_dir + f"/patch_feature_cache/seed={seed}") if args.save_patch_feature_cache else None,
                                                                                 save_patch_dists = (args.eval_clf or args.inference_split != "test"), # keep patch maps for non-test inference runs
                                                                                 save_tiffs = args.eval_segm)      # save anomaly maps as tiffs for segmentation evaluation
 

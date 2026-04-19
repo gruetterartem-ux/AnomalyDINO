@@ -123,17 +123,18 @@ def load_run_args(experiment_dir: Path) -> Dict:
     with args_path.open("r", encoding="utf-8") as handle:
         run_args = yaml.safe_load(handle)
 
-    if run_args.get("aggregation_statistics") != "max_patch_distance":
+    if run_args.get("aggregation_statistics") not in {"max_patch_distance", "max_anomaly_map"}:
         raise ValueError(
-            "This ROI export expects runs with aggregation_statistics=max_patch_distance, "
+            "This ROI export expects runs with aggregation_statistics=max_patch_distance or "
+            f"max_anomaly_map, "
             f"got {run_args.get('aggregation_statistics')!r}."
         )
 
     model_name = str(run_args.get("model_name", ""))
-    if not model_name.startswith("dinov2"):
+    if not model_name.startswith(("dinov2", "dinov3")):
         raise ValueError(
-            "This script currently supports DINOv2 runs only, because the ROI mapping reuses "
-            "the DINOv2 resize + crop logic."
+            "This script currently supports DINOv2/DINOv3 runs only, because the ROI mapping "
+            "reuses the dense-backbone resize + crop logic."
         )
 
     return run_args
@@ -142,6 +143,8 @@ def load_run_args(experiment_dir: Path) -> Dict:
 def infer_patch_multiple(model_name: str) -> int:
     if model_name.startswith("dinov2"):
         return 14
+    if model_name.startswith("dinov3"):
+        return 16
     raise ValueError(f"Could not infer patch size for model {model_name!r}.")
 
 
@@ -159,13 +162,60 @@ def load_measurements(measurements_file: Path) -> Dict[Tuple[str, str], Dict[str
     return rows
 
 
-def resized_image_for_dinov2(image: Image.Image, smaller_edge_size: int) -> Image.Image:
+def lookup_measurement_row(
+    measurements: Dict[Tuple[str, str], Dict[str, str]],
+    object_name: str,
+    split_name: str,
+    sample_no_ext: str,
+) -> Dict[str, str] | None:
+    row = measurements.get((object_name, sample_no_ext))
+    if row is not None:
+        return row
+
+    if split_name == "custom_eval":
+        if sample_no_ext.startswith("bad/"):
+            return measurements.get((object_name, f"test/{sample_no_ext}"))
+        if sample_no_ext.startswith("good/"):
+            return measurements.get((object_name, f"test/{sample_no_ext}"))
+    return None
+
+
+def resized_image_for_dense_backbone(image: Image.Image, smaller_edge_size: int) -> Image.Image:
     resize = transforms.Resize(
         size=smaller_edge_size,
         interpolation=transforms.InterpolationMode.BICUBIC,
         antialias=True,
     )
     return resize(image)
+
+
+def resolve_original_image_path(data_root: Path, object_name: str, split_name: str, sample: str) -> Path:
+    sample_path = Path(sample.replace("\\", "/"))
+    sample_posix = sample_path.as_posix()
+
+    if split_name == "custom_eval":
+        if sample_posix.startswith("good_train_remaining/"):
+            relative = sample_path.relative_to("good_train_remaining")
+            image_path = data_root / object_name / "train" / "good" / relative
+        elif sample_posix.startswith("good_test/"):
+            relative = sample_path.relative_to("good_test")
+            image_path = data_root / object_name / "test" / "good" / relative
+        elif sample_posix.startswith("test/bad/"):
+            relative = sample_path.relative_to("test/bad")
+            image_path = data_root / object_name / "test" / "bad" / relative
+        elif sample_posix.startswith("test/good/"):
+            relative = sample_path.relative_to("test/good")
+            image_path = data_root / object_name / "test" / "good" / relative
+        else:
+            raise FileNotFoundError(
+                f"Could not resolve custom_eval sample {sample!r} for object {object_name!r}."
+            )
+    else:
+        image_path = data_root / object_name / split_name / sample_path
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"Source image not found: {image_path}")
+    return image_path
 
 
 def component_boxes(binary_map: np.ndarray) -> Iterable[Tuple[int, int, int, int, np.ndarray]]:
@@ -517,8 +567,7 @@ def main():
         object_name = rel_path.parts[0]
         split_name = rel_path.parts[1]
         sample_no_ext = str(Path(*rel_path.parts[2:]).with_suffix("")).replace("\\", "/")
-        sample_key = (object_name, sample_no_ext)
-        row = measurements.get(sample_key)
+        row = lookup_measurement_row(measurements, object_name, split_name, sample_no_ext)
         if row is None:
             print(f"Skipping {rel_path}: no matching measurement row found.")
             continue
@@ -538,15 +587,16 @@ def main():
         box_blocked_mask = np.zeros_like(valid_mask, dtype=bool)
 
         sample_rel_path = Path(row["Sample"].replace("\\", "/"))
-        image_path = data_root / object_name / split_name / sample_rel_path
-        if not image_path.exists():
-            print(f"Skipping {rel_path}: source image not found at {image_path}.")
+        try:
+            image_path = resolve_original_image_path(data_root, object_name, split_name, row["Sample"])
+        except FileNotFoundError as exc:
+            print(f"Skipping {rel_path}: {exc}")
             continue
 
         with Image.open(image_path) as image_handle:
             image = image_handle.convert("RGB")
             original_size = image.size
-            resized = resized_image_for_dinov2(image, resolution)
+            resized = resized_image_for_dense_backbone(image, resolution)
             resized_size = resized.size
 
             accepted_regions: List[Dict[str, object]] = []

@@ -7,9 +7,35 @@ import faiss
 import tifffile as tiff
 import time
 import torch
+from PIL import Image
 
 from src.utils import augment_image, dists2map, plot_ref_images, list_image_files
 from src.post_eval import mean_top1p
+
+
+def feature_cache_file(feature_cache_dir, object_name, sample_key):
+    safe_sample = os.path.splitext(sample_key)[0] + ".npz"
+    return os.path.join(feature_cache_dir, object_name, safe_sample)
+
+
+def save_feature_cache_entry(cache_file, sample_key, image_path, image_rgb, model, grid_size, features):
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    if getattr(model, "resize_transform", None) is not None:
+        resized_image = model.resize_transform(Image.fromarray(image_rgb))
+        resized_width, resized_height = resized_image.size
+    else:
+        resized_height, resized_width = grid_size[0] * model.patch_size, grid_size[1] * model.patch_size
+
+    np.savez_compressed(
+        cache_file,
+        sample=sample_key,
+        image_path=image_path,
+        features=features.astype(np.float16),
+        grid_size=np.asarray(grid_size, dtype=np.int32),
+        resized_size=np.asarray([resized_width, resized_height], dtype=np.int32),
+        original_size=np.asarray([image_rgb.shape[1], image_rgb.shape[0]], dtype=np.int32),
+        patch_size=np.asarray([int(model.patch_size)], dtype=np.int32),
+    )
 
 def run_anomaly_detection(
         model,
@@ -32,6 +58,7 @@ def run_anomaly_detection(
         aggregation_statistics = "meantop1p",
         inference_split = "test",
         eval_remaining_train_good = False,
+        feature_cache_dir = None,
         save_patch_dists = True,
         save_tiffs = False):
     """
@@ -235,6 +262,18 @@ def run_anomaly_detection(
                 image_test = cv2.cvtColor(cv2.imread(image_test_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
                 image_tensor2, grid_size2 = model.prepare_image(image_test)
                 features2 = model.extract_features(image_tensor2)
+                if feature_cache_dir is not None:
+                    cache_file = feature_cache_file(feature_cache_dir, object_name, sample_key=f"{display_group}/{img_test_nr}".replace("\\", "/"))
+                    if not os.path.exists(cache_file):
+                        save_feature_cache_entry(
+                            cache_file=cache_file,
+                            sample_key=f"{display_group}/{img_test_nr}".replace("\\", "/"),
+                            image_path=image_test_path,
+                            image_rgb=image_test,
+                            model=model,
+                            grid_size=grid_size2,
+                            features=features2,
+                        )
 
                 # Compute background mask
                 if masking:
