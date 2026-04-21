@@ -1,6 +1,6 @@
-# AnomalyDINO Similarity Explorer
+# AnomalyDINO Explorer
 
-Lokale Streamlit-App fuer dense Patch-Aehnlichkeit auf dem bestehenden `res=688`-AnomalyDINO-Run.
+Lokale Streamlit-App fuer dense Patch-Aehnlichkeit und Bauteil-Tests auf dem bestehenden `res=688`-AnomalyDINO-Run.
 
 ## Was die App macht
 
@@ -41,10 +41,56 @@ Lokale Streamlit-App fuer dense Patch-Aehnlichkeit auf dem bestehenden `res=688`
   - skaliert damit den finalen Normalmap-Patchvektor und normalisiert danach wieder auf `L2`
   - laesst Query-Selektion, Softmax-Mittelung und Cosine-Retrieval ansonsten unveraendert
   - dieser Modus laeuft auf dem Normalmap-Zweig bewusst `ohne` Positionskorrektur, damit er direkt dem zuvor gelernten Multi-Layer-Satz entspricht
+- optional mit `Top10%-Klassifikator: nur die 32 I-Relief-Features auf Normalmap verwenden`
+  - nutzt den Multilayer-Normalmap-Zweig des `top10%`-Klassifikators
+  - wendet zuerst dessen Multi-Layer-`I-Relief`-Reweight an
+  - schneidet danach auf genau die gespeicherten `32` Klassifikator-Merkmale
+  - normalisiert den reduzierten Vektor wieder auf `L2`
+  - ist fuer einen direkten Patch-Retrieval-Vergleich gegen den Klassifikator-Merkmalsraum gedacht
+- optional mit `Top1-Patch-Klassifikator auf Query-Patches auswerten`
+  - baut aus den aktuell ausgewaehlten Query-Patches den gewohnten softmax-gewichteten Aggregatvektor
+  - bei genau einem Query-Patch ist die Gewichtung automatisch `1.0`
+  - schickt diesen Vektor danach durch den finalen `top1patch`-Endklassifikator
+  - zeigt `2D/3D` sowie `p(2D)` und `p(3D)` direkt in der App an
+  - ist fuer manuelles Testen des Einzelpatch-Klassifikators auf frei ausgewaehlten Fehlerpatches gedacht
 - zeigt die Similarity-Heatmap als Overlay auf dem Zielbild
 - zeigt optional zusaetzlich die vorhandene Target-Anomaly-Map
 - listet die Top-Matches im Zielbild und zeigt deren Patch-Crops
 - exportiert den aktuellen View als `PNG + JSON`
+- zusaetzlich gibt es die Ansicht `Bauteil-Test`
+  - kann entweder auf den im aktuellen Run bereits vorhandenen AnomalyDINO-Scores und ROI-Boxen arbeiten
+  - oder externe Bilder mit frischer End-to-End-Inferenz verarbeiten
+    - DINOv3-Backbone laden
+    - Referenzbank aus den gespeicherten Few-Shot-Referenzbildern des Runs aufbauen
+    - frische Patch-Anomaliescores berechnen
+    - ROI-Boxen mit derselben Hysterese-/Merge-Logik wie im Training extrahieren
+    - danach das finale `Boruta + RBF-SVM`-Endmodell pro ROI anwenden
+  - nutzt fuer die ROI-Klassifikation das finale `Boruta + RBF-SVM`-Endmodell
+  - entscheidet pro Bild erst `IO/NIO`, danach pro ROI `2D/3D` und am Ende auf Bauteilebene:
+    - sobald irgendeine ROI `3D` ist, ist das ganze Bauteil `3D`
+    - sonst ist ein `NIO`-Bauteil `2D`
+  - rendert Overlays nur, wenn die Checkbox dafuer gesetzt wird
+- zusaetzlich gibt es die Ansicht `Einstellungen`
+  - mit dem Reiter `Anomaly Detection`
+  - dort koennen pro Objekt gespeichert werden:
+    - `Referenzbilder`
+    - `Testbilder good`
+    - `Testbilder bad`
+  - neue Uploads werden der jeweiligen Kategorie hinzugefuegt
+  - dieselbe Kategorie kann also mehrfach nacheinander befuellt werden
+  - die Bilder werden lokal unter dem aktuellen Experiment gespeichert
+  - per Button `Evaluierung starten` werden fuer alle gespeicherten Testbilder frische Bildscores berechnet
+  - danach wird der beste `Bildthreshold` nach `F1` fuer `good/bad` bestimmt
+  - ein feiner Schieberegler plus exakte Zahleneingabe erlauben anschliessend Live-Analyse von:
+    - `Precision`
+    - `Recall`
+    - `F1`
+    - `Accuracy`
+  - per Button kann der aktuell eingestellte `Bildthreshold` bestaetigt und als aktive Konfiguration gespeichert werden
+  - der externe Modus im `Bauteil-Test` verwendet dann genau diese bestaetigte Anomaly-Detection-Konfiguration
+    - bestaetigter `Bildthreshold`
+    - bestaetigte Referenzbilder
+  - diese Seite bewertet bewusst nur `IO/NIO` auf Bildebene und nicht ROI- oder `2D/3D`-Klassifikation
 
 ## Start
 
@@ -80,6 +126,16 @@ Der Run muss enthalten:
   - `patch_feature_cache_multilayer_l1to12/seed=0/cache_manifest.csv`
   - die zugehoerigen Multi-Layer-`.npz`-Caches
   - `roi_top10pct_centerinbox_multilayer_l1to12_softmax_patch_features_labeled/irelief_cosine_weighted_features/irelief_feature_scale_sqrt.npy`
+- fuer `Top10%-Klassifikator: nur die 32 I-Relief-Features auf Normalmap verwenden` zusaetzlich:
+  - `final_all_boxes_top10pct_multilayer_irelief_fixedk32_rbf/selected_topk_features.csv`
+  - sowie weiterhin der Multi-Layer-I-Relief-Gewichtsvektor aus
+    `roi_top10pct_centerinbox_multilayer_l1to12_softmax_patch_features_labeled/irelief_cosine_weighted_features/irelief_feature_scale_sqrt.npy`
+- fuer `Bauteil-Test` zusaetzlich:
+  - `roi_crops_peak_hysteresis_h0.5_l0.2_merge3bridge0.1/seed=0/roi_metadata.csv`
+  - `patch_feature_cache_multilayer_l1to12/seed=0/cache_manifest.csv`
+  - die zugehoerigen Multi-Layer-`.npz`-Caches
+  - `final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf/classifier_pipeline.joblib`
+  - `final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf/selected_features.csv`
 
 ## Export
 
