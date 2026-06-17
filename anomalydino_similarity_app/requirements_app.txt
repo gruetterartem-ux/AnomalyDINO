@@ -1,0 +1,14 @@
+torch
+torchvision
+opencv-python
+Pillow
+numpy==1.26
+scipy
+scikit-learn
+pandas
+PyYAML
+streamlit
+streamlit-image-coordinates
+transformers
+huggingface_hub
+timm

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ import torch
 import yaml
 from PIL import Image
 from joblib import load as joblib_load
+from scipy.ndimage import label as nd_label
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -73,9 +76,17 @@ from src.post_eval import mean_top1p
 from src.utils import augment_image, dists2map
 
 
-DEFAULT_EXPERIMENT_DIR = Path(
-    r"C:\ai\AnomalyDINO\results_CUSTOM\dinov3_vitb16_688"
-    r"\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413"
+DEFAULT_EXPERIMENT_DIR = (
+    REPO_ROOT
+    / "results_CUSTOM"
+    / "dinov3_vitb16_688"
+    / "8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413"
+)
+NORMALMAPALBEDO_EXPERIMENT_DIR = (
+    REPO_ROOT
+    / "results_CUSTOM"
+    / "dinov3_vitb16_688"
+    / "4-shot_preprocess=force_no_mask_no_rotation_buttonsfusion_3drecallsearch4_proxyverify_maxpatch_res688_evaltrain_20260423"
 )
 
 EXPORT_SUBDIR = "similarity_query_exports"
@@ -85,6 +96,9 @@ TOP10PCT_CLASSIFIER_FEATURE_SUBDIR = "final_all_boxes_top10pct_multilayer_irelie
 TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR = "final_all_boxes_top1patch_multilayer_irelief_fixedk32_rbf"
 BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
     "final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf"
+)
+MRMR_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
+    "final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf"
 )
 IRELIEF_SUBDIR = (
     "roi_top10pct_centerinbox_pca2_softmax_patch_features_labeled"
@@ -109,6 +123,13 @@ ANOMALY_DETECTION_REFERENCE_SUBDIR = "reference_images"
 ANOMALY_DETECTION_TEST_GOOD_SUBDIR = "test_good"
 ANOMALY_DETECTION_TEST_BAD_SUBDIR = "test_bad"
 ANOMALY_DETECTION_CONFIRMED_CONFIG_FILENAME = "confirmed_threshold_config.json"
+TEST_DATASET_VIEW_KEY = "test_dataset_view_results"
+TEST_DATASET_UPLOAD_NONCE_KEY = "test_dataset_upload_nonce"
+TEST_DATASET_UPLOAD_FLASH_KEY = "test_dataset_upload_flash"
+TEST_DATASET_SUBDIR = "test_dataset"
+TEST_DATASET_IMAGES_SUBDIR = "images"
+TEST_DATASET_MANIFEST_FILENAME = "manifest.csv"
+TEST_DATASET_EVALUATIONS_SUBDIR = "evaluations"
 COMPONENT_TEST_ROI_SETTINGS = {
     "high_prominence_ratio": 0.5,
     "low_prominence_ratio": 0.2,
@@ -118,10 +139,30 @@ COMPONENT_TEST_ROI_SETTINGS = {
     "min_prominence": 0.02,
     "min_region_mass": 0.05,
     "block_boxes": True,
-    "merge_gap_patches": 3,
+    "merge_gap_patches": 1,
     "merge_bridge_ratio": 0.1,
     "max_boxes_per_image": None,
+    "coverage_hot_patches": True,
+    "final_touch_merge": True,
 }
+COMPONENT_TEST_ROI_LOGIC_PROFILES = {
+    "buttons_new": {
+        "label": "Neue Buttons-Logik",
+        "description": "gap=1, Coverage-Pass fuer Hot-Patches, finaler Touch-Merge",
+        "settings": COMPONENT_TEST_ROI_SETTINGS,
+    },
+    "normalmap_old": {
+        "label": "Alte Normalmap-Logik",
+        "description": "klassische Hysterese-Extraktion mit gap=3 ohne Coverage-Pass",
+        "settings": {
+            **COMPONENT_TEST_ROI_SETTINGS,
+            "merge_gap_patches": 3,
+            "coverage_hot_patches": False,
+            "final_touch_merge": False,
+        },
+    },
+}
+DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY = "buttons_new"
 
 
 def _parse_experiment_dir_from_argv() -> str:
@@ -132,6 +173,13 @@ def _parse_experiment_dir_from_argv() -> str:
     if not argv:
         return str(DEFAULT_EXPERIMENT_DIR)
     return argv[0]
+
+
+def _anomaly_detection_input_profile_dirs(base_experiment_dir_str: str) -> dict[str, str]:
+    return {
+        "normalmap": str(Path(base_experiment_dir_str).resolve()),
+        "normalmapalbedo": str(NORMALMAPALBEDO_EXPERIMENT_DIR.resolve()),
+    }
 
 
 def _clean_sample_name(sample: str) -> str:
@@ -673,6 +721,18 @@ def _anomaly_detection_confirmed_config_path(experiment_dir_str: str, object_nam
     return _anomaly_detection_object_dir(experiment_dir_str, object_name) / ANOMALY_DETECTION_CONFIRMED_CONFIG_FILENAME
 
 
+def _test_dataset_object_dir(experiment_dir_str: str, object_name: str) -> Path:
+    return Path(experiment_dir_str).resolve() / APP_SETTINGS_SUBDIR / TEST_DATASET_SUBDIR / _safe_name(object_name)
+
+
+def _test_dataset_images_dir(experiment_dir_str: str, object_name: str) -> Path:
+    return _test_dataset_object_dir(experiment_dir_str, object_name) / TEST_DATASET_IMAGES_SUBDIR
+
+
+def _test_dataset_manifest_path(experiment_dir_str: str, object_name: str) -> Path:
+    return _test_dataset_object_dir(experiment_dir_str, object_name) / TEST_DATASET_MANIFEST_FILENAME
+
+
 def _list_saved_anomaly_detection_images(
     experiment_dir_str: str,
     object_name: str,
@@ -723,6 +783,130 @@ def load_anomaly_detection_confirmed_config(experiment_dir_str: str, object_name
     if not config_path.exists():
         return None
     return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def _empty_test_dataset_manifest() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "part_id",
+            "image_filename",
+            "object_name",
+            "gt_part_label",
+            "note",
+            "created_at",
+            "labeled_at",
+        ]
+    )
+
+
+def load_test_dataset_manifest(experiment_dir_str: str, object_name: str) -> pd.DataFrame:
+    manifest_path = _test_dataset_manifest_path(experiment_dir_str, object_name)
+    if not manifest_path.exists():
+        return _empty_test_dataset_manifest()
+    manifest_df = pd.read_csv(manifest_path, dtype=str).fillna("")
+    for required_col in _empty_test_dataset_manifest().columns:
+        if required_col not in manifest_df.columns:
+            manifest_df[required_col] = ""
+    manifest_df = manifest_df[_empty_test_dataset_manifest().columns.tolist()].copy()
+    return manifest_df
+
+
+def _write_test_dataset_manifest(experiment_dir_str: str, object_name: str, manifest_df: pd.DataFrame) -> Path:
+    manifest_path = _test_dataset_manifest_path(experiment_dir_str, object_name)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_df = manifest_df.copy()
+    manifest_df = manifest_df[_empty_test_dataset_manifest().columns.tolist()]
+    manifest_df.to_csv(manifest_path, index=False)
+    return manifest_path
+
+
+def _list_test_dataset_images(experiment_dir_str: str, object_name: str) -> list[Path]:
+    image_dir = _test_dataset_images_dir(experiment_dir_str, object_name)
+    allowed_exts = {f".{ext.lower()}" for ext in COMPONENT_TEST_UPLOAD_EXTENSIONS}
+    if not image_dir.exists():
+        return []
+    return sorted(
+        [path for path in image_dir.iterdir() if path.is_file() and path.suffix.lower() in allowed_exts],
+        key=lambda path: path.name.lower(),
+    )
+
+
+def _save_uploaded_test_dataset_images(
+    experiment_dir_str: str,
+    object_name: str,
+    uploaded_files: list[Any],
+) -> list[str]:
+    target_dir = _test_dataset_images_dir(experiment_dir_str, object_name)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_names: list[str] = []
+    used_names: set[str] = {
+        existing_file.name.lower()
+        for existing_file in target_dir.iterdir()
+        if existing_file.is_file()
+    }
+    for uploaded_file in uploaded_files:
+        raw_name = Path(str(uploaded_file.name)).name
+        stem = _safe_name(Path(raw_name).stem) or "image"
+        suffix = Path(raw_name).suffix.lower() or ".png"
+        candidate_name = f"{stem}{suffix}"
+        counter = 2
+        while candidate_name.lower() in used_names:
+            candidate_name = f"{stem}_{counter}{suffix}"
+            counter += 1
+        used_names.add(candidate_name.lower())
+        (target_dir / candidate_name).write_bytes(uploaded_file.getvalue())
+        saved_names.append(candidate_name)
+    return saved_names
+
+
+def _sync_test_dataset_manifest_with_images(
+    experiment_dir_str: str,
+    object_name: str,
+    image_filenames: list[str],
+) -> pd.DataFrame:
+    manifest_df = load_test_dataset_manifest(experiment_dir_str, object_name)
+    existing_names = set(manifest_df["image_filename"].astype(str).tolist())
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    new_rows: list[dict[str, Any]] = []
+    for image_filename in image_filenames:
+        if image_filename in existing_names:
+            continue
+        new_rows.append(
+            {
+                "part_id": Path(image_filename).stem,
+                "image_filename": image_filename,
+                "object_name": object_name,
+                "gt_part_label": "",
+                "note": "",
+                "created_at": timestamp,
+                "labeled_at": "",
+            }
+        )
+    if new_rows:
+        manifest_df = pd.concat([manifest_df, pd.DataFrame(new_rows)], ignore_index=True)
+        _write_test_dataset_manifest(experiment_dir_str, object_name, manifest_df)
+    return manifest_df
+
+
+def _update_test_dataset_label(
+    experiment_dir_str: str,
+    object_name: str,
+    image_filename: str,
+    part_id: str,
+    gt_part_label: str,
+    note: str,
+) -> Path:
+    manifest_df = load_test_dataset_manifest(experiment_dir_str, object_name)
+    row_mask = manifest_df["image_filename"].astype(str) == str(image_filename)
+    if not bool(row_mask.any()):
+        raise KeyError(f"Bild nicht im Testdatensatz-Manifest gefunden: {image_filename}")
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    manifest_df.loc[row_mask, "part_id"] = str(part_id).strip()
+    manifest_df.loc[row_mask, "gt_part_label"] = str(gt_part_label).strip()
+    manifest_df.loc[row_mask, "note"] = str(note)
+    manifest_df.loc[row_mask, "labeled_at"] = timestamp if str(gt_part_label).strip() else ""
+    return _write_test_dataset_manifest(experiment_dir_str, object_name, manifest_df)
 
 
 def _resolve_confirmed_reference_paths(
@@ -953,6 +1137,151 @@ def _sync_state_value(target_key: str, source_key: str) -> None:
         st.session_state[target_key] = st.session_state[source_key]
 
 
+def _classifier_signature_for_subdir(experiment_dir_str: str, classifier_subdir: str) -> tuple[tuple[str, int, int], ...]:
+    classifier_dir = Path(experiment_dir_str).resolve() / classifier_subdir
+    return _classifier_file_signature(
+        classifier_dir / "selected_features.csv",
+        classifier_dir / "selected_feature_indices.npy",
+        classifier_dir / "classifier_pipeline.joblib",
+        classifier_dir / "model_info.json",
+        classifier_dir / "summary.json",
+    )
+
+
+def _load_selected_component_classifier(experiment_dir_str: str, classifier_choice: str) -> dict[str, Any]:
+    if classifier_choice == "Boruta":
+        return load_boruta_component_classifier_model(
+            experiment_dir_str,
+            _classifier_signature_for_subdir(experiment_dir_str, BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR),
+        )
+    if classifier_choice == "mRMR":
+        return load_mrmr_component_classifier_model(
+            experiment_dir_str,
+            _classifier_signature_for_subdir(experiment_dir_str, MRMR_COMPONENT_CLASSIFIER_FEATURE_SUBDIR),
+        )
+    raise ValueError(f"Unbekannter Klassifikator: {classifier_choice}")
+
+
+def _normalize_image_level_part_prediction(raw_part_label: str) -> str:
+    label = str(raw_part_label)
+    if label in {"IO", "2D", "3D"}:
+        return label
+    if label == "NIO_no_roi":
+        return "2D"
+    return label
+
+
+def _compute_three_class_metrics(true_labels: list[str], pred_labels: list[str]) -> dict[str, Any]:
+    labels = ["IO", "2D", "3D"]
+    precision, recall, f1, support = precision_recall_fscore_support(
+        true_labels,
+        pred_labels,
+        labels=labels,
+        average=None,
+        zero_division=0,
+    )
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        true_labels,
+        pred_labels,
+        labels=labels,
+        average="macro",
+        zero_division=0,
+    )
+    conf = confusion_matrix(true_labels, pred_labels, labels=labels)
+    return {
+        "accuracy": float(accuracy_score(true_labels, pred_labels)),
+        "macro_precision": float(macro_precision),
+        "macro_recall": float(macro_recall),
+        "macro_f1": float(macro_f1),
+        "labels": labels,
+        "confusion_matrix": conf.astype(int).tolist(),
+        "per_class": {
+            label: {
+                "precision": float(precision[idx]),
+                "recall": float(recall[idx]),
+                "f1": float(f1[idx]),
+                "support": int(support[idx]),
+            }
+            for idx, label in enumerate(labels)
+        },
+    }
+
+
+def _aggregate_part_level_predictions(image_result_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    if not image_result_rows:
+        return pd.DataFrame(
+            columns=[
+                "part_id",
+                "gt_part_label",
+                "pred_part_label",
+                "num_images",
+                "num_pred_io_images",
+                "num_pred_2d_images",
+                "num_pred_3d_images",
+                "max_image_score",
+            ]
+        )
+
+    image_df = pd.DataFrame(image_result_rows).copy()
+    image_df["pred_part_label_for_metrics"] = image_df["raw_pred_part_label"].map(_normalize_image_level_part_prediction)
+
+    part_rows: list[dict[str, Any]] = []
+    for part_id, group_df in image_df.groupby("part_id", sort=True):
+        gt_labels = sorted({str(value) for value in group_df["gt_part_label"].tolist() if str(value)})
+        if len(gt_labels) != 1:
+            raise ValueError(f"Uneinheitliche Ground-Truth-Labels fuer part_id={part_id}: {gt_labels}")
+        pred_labels = group_df["pred_part_label_for_metrics"].astype(str).tolist()
+        if any(label == "3D" for label in pred_labels):
+            pred_part_label = "3D"
+        elif any(label == "2D" for label in pred_labels):
+            pred_part_label = "2D"
+        else:
+            pred_part_label = "IO"
+
+        part_rows.append(
+            {
+                "part_id": str(part_id),
+                "gt_part_label": gt_labels[0],
+                "pred_part_label": pred_part_label,
+                "num_images": int(group_df.shape[0]),
+                "num_pred_io_images": int(np.sum(group_df["pred_part_label_for_metrics"] == "IO")),
+                "num_pred_2d_images": int(np.sum(group_df["pred_part_label_for_metrics"] == "2D")),
+                "num_pred_3d_images": int(np.sum(group_df["pred_part_label_for_metrics"] == "3D")),
+                "max_image_score": float(group_df["image_score"].max()),
+            }
+        )
+    return pd.DataFrame(part_rows)
+
+
+def _save_test_dataset_evaluation_artifacts(
+    experiment_dir_str: str,
+    object_name: str,
+    classifier_choice: str,
+    image_result_df: pd.DataFrame,
+    part_result_df: pd.DataFrame,
+    summary: dict[str, Any],
+) -> dict[str, str]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    evaluation_dir = (
+        _test_dataset_object_dir(experiment_dir_str, object_name)
+        / TEST_DATASET_EVALUATIONS_SUBDIR
+        / f"{timestamp}_{_safe_name(classifier_choice.lower())}"
+    )
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+    image_predictions_path = evaluation_dir / "predictions_image_level.csv"
+    part_predictions_path = evaluation_dir / "predictions_part_level.csv"
+    summary_path = evaluation_dir / "summary.json"
+    image_result_df.to_csv(image_predictions_path, index=False)
+    part_result_df.to_csv(part_predictions_path, index=False)
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {
+        "evaluation_dir": str(evaluation_dir),
+        "predictions_image_level_csv": str(image_predictions_path),
+        "predictions_part_level_csv": str(part_predictions_path),
+        "summary_json": str(summary_path),
+    }
+
+
 @st.cache_resource(show_spinner="Baue Top1-Patch-Klassifikator-Endmodell...")
 def load_top1patch_classifier_model(
     experiment_dir_str: str,
@@ -1013,20 +1342,44 @@ def load_component_test_live_config(
 ) -> dict[str, Any]:
     experiment_dir = Path(experiment_dir_str).resolve()
     run_args = load_run_args(experiment_dir)
-    run_samples = load_run_samples(experiment_dir, seed=int(seed))
     preprocess_path = experiment_dir / "preprocess.yaml"
     preprocess_data = yaml.safe_load(preprocess_path.read_text(encoding="utf-8")) if preprocess_path.exists() else {}
     data_root = Path(str(run_args.get("data_root", ""))).resolve()
     _ = train_good_signatures
-
-    object_names = sorted({sample.object_name for sample in run_samples})
+    object_names: list[str] = []
     threshold_by_object: dict[str, float] = {}
-    for object_name in object_names:
-        object_thresholds = [round(float(sample.image_threshold), 8) for sample in run_samples if sample.object_name == object_name]
-        if not object_thresholds:
-            continue
-        counts = pd.Series(object_thresholds).value_counts()
-        threshold_by_object[object_name] = float(counts.index[0])
+    run_samples_error: Exception | None = None
+    try:
+        run_samples = load_run_samples(experiment_dir, seed=int(seed))
+        object_names = sorted({sample.object_name for sample in run_samples})
+        for object_name in object_names:
+            object_thresholds = [
+                round(float(sample.image_threshold), 8)
+                for sample in run_samples
+                if sample.object_name == object_name
+            ]
+            if not object_thresholds:
+                continue
+            counts = pd.Series(object_thresholds).value_counts()
+            threshold_by_object[object_name] = float(counts.index[0])
+    except Exception as exc:
+        run_samples_error = exc
+        measurements_path = experiment_dir / f"measurements_seed={int(seed)}.csv"
+        if not measurements_path.exists():
+            raise
+        measurements_df = pd.read_csv(measurements_path)
+        if "Object" not in measurements_df.columns or "Threshold" not in measurements_df.columns:
+            raise RuntimeError(
+                f"Measurements file {measurements_path} does not contain required columns 'Object' and 'Threshold'."
+            ) from exc
+        object_names = sorted({str(value) for value in measurements_df["Object"].dropna().astype(str).tolist()})
+        for object_name in object_names:
+            object_rows = measurements_df.loc[measurements_df["Object"].astype(str) == object_name]
+            if object_rows.empty:
+                continue
+            object_thresholds = object_rows["Threshold"].astype(float).round(8)
+            counts = object_thresholds.value_counts()
+            threshold_by_object[object_name] = float(counts.index[0])
 
     stored_ref_images_by_object: dict[str, list[str]] = {}
     current_train_good_images_by_object: dict[str, list[str]] = {}
@@ -1067,6 +1420,7 @@ def load_component_test_live_config(
         "resolution": int(run_args.get("resolution", 688)),
         "model_name": str(run_args.get("model_name", "")),
         "backbone_weights": run_args.get("backbone_weights"),
+        "run_samples_error": str(run_samples_error) if run_samples_error is not None else None,
     }
 
 
@@ -1231,12 +1585,84 @@ def _extract_live_component_rois(
     image_threshold: float,
     resized_size: tuple[int, int],
     patch_multiple: int,
+    roi_logic_key: str = DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY,
 ) -> pd.DataFrame:
+    def _box_coverage_mask(regions: list[dict[str, Any]]) -> np.ndarray:
+        covered = np.zeros_like(valid_mask, dtype=bool)
+        for region in regions:
+            row_min, row_max, col_min, col_max = region["patch_box"]
+            covered[row_min : row_max + 1, col_min : col_max + 1] = True
+        return covered
+
+    def _patch_box_gap(
+        box_a: tuple[int, int, int, int],
+        box_b: tuple[int, int, int, int],
+    ) -> int:
+        a_row_min, a_row_max, a_col_min, a_col_max = [int(v) for v in box_a]
+        b_row_min, b_row_max, b_col_min, b_col_max = [int(v) for v in box_b]
+        row_gap = max(0, b_row_min - a_row_max - 1, a_row_min - b_row_max - 1)
+        col_gap = max(0, b_col_min - a_col_max - 1, a_col_min - b_col_max - 1)
+        return int(max(row_gap, col_gap))
+
+    def _region_peak_score(region: dict[str, Any]) -> float:
+        region_mask = np.asarray(region["region_mask"], dtype=bool)
+        if not np.any(region_mask):
+            return float("-inf")
+        return float(score_grid[region_mask].max())
+
+    def _merge_region_group(region_group: list[dict[str, Any]]) -> dict[str, Any]:
+        merged_mask = np.zeros_like(valid_mask, dtype=bool)
+        for region in region_group:
+            merged_mask |= np.asarray(region["region_mask"], dtype=bool)
+        strongest_region = max(
+            region_group,
+            key=lambda region: (float(region.get("prominence", 0.0)), _region_peak_score(region)),
+        )
+        return {
+            "region_mask": merged_mask,
+            "patch_box": region_box(merged_mask),
+            "background_source": str(strongest_region["background_source"]),
+            "background_value": float(strongest_region["background_value"]),
+            "prominence": float(strongest_region["prominence"]),
+            "high_threshold": float(strongest_region["high_threshold"]),
+            "low_threshold": float(strongest_region["low_threshold"]),
+            "ring_patch_count": int(strongest_region["ring_patch_count"]),
+            "proposal_count": int(sum(int(region.get("proposal_count", 1)) for region in region_group)),
+        }
+
+    def _consolidate_regions_by_gap(regions: list[dict[str, Any]], gap: int) -> list[dict[str, Any]]:
+        if len(regions) <= 1:
+            return list(regions)
+        pending_regions = sorted(regions, key=lambda region: strength_key(score_grid, region), reverse=True)
+        consolidated_regions: list[dict[str, Any]] = []
+        while pending_regions:
+            base_region = pending_regions.pop(0)
+            region_group = [base_region]
+            changed = True
+            while changed:
+                changed = False
+                current_box = region_box(np.any(np.stack([np.asarray(region["region_mask"], dtype=bool) for region in region_group], axis=0), axis=0))
+                remaining_regions: list[dict[str, Any]] = []
+                for region in pending_regions:
+                    if _patch_box_gap(current_box, region["patch_box"]) <= int(gap):
+                        region_group.append(region)
+                        changed = True
+                    else:
+                        remaining_regions.append(region)
+                pending_regions = remaining_regions
+            consolidated_regions.append(_merge_region_group(region_group))
+        consolidated_regions.sort(key=lambda region: strength_key(score_grid, region), reverse=True)
+        return consolidated_regions
+
     valid_mask = score_grid > 0.0
+    profile = COMPONENT_TEST_ROI_LOGIC_PROFILES.get(
+        str(roi_logic_key),
+        COMPONENT_TEST_ROI_LOGIC_PROFILES[DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY],
+    )
+    settings = dict(profile["settings"])
     consumed_mask = np.zeros_like(valid_mask, dtype=bool)
     rejected_mask = np.zeros_like(valid_mask, dtype=bool)
     box_blocked_mask = np.zeros_like(valid_mask, dtype=bool)
-    settings = COMPONENT_TEST_ROI_SETTINGS
     accepted_regions: list[dict[str, Any]] = []
 
     while True:
@@ -1298,7 +1724,6 @@ def _extract_live_component_rois(
             "ring_patch_count": int(ring_mask.sum()),
             "proposal_count": 1,
         }
-
         changed = True
         while changed:
             changed = False
@@ -1312,17 +1737,17 @@ def _extract_live_component_rois(
                     box_a=merged_box,
                     background_a=float(merged_summary["background_value"]),
                     prominence_a=float(merged_summary["prominence"]),
-                    region_b=accepted_region["region_mask"],
+                    region_b=np.asarray(accepted_region["region_mask"], dtype=bool),
                     box_b=accepted_region["patch_box"],
                     background_b=float(accepted_region["background_value"]),
                     prominence_b=float(accepted_region["prominence"]),
                     gap=int(settings["merge_gap_patches"]),
                     bridge_ratio=float(settings["merge_bridge_ratio"]),
                 ):
-                    merged_mask |= accepted_region["region_mask"]
+                    merged_mask |= np.asarray(accepted_region["region_mask"], dtype=bool)
                     merged_summary["proposal_count"] += int(accepted_region["proposal_count"])
                     if float(accepted_region["prominence"]) > float(merged_summary["prominence"]):
-                        merged_summary["background_source"] = accepted_region["background_source"]
+                        merged_summary["background_source"] = str(accepted_region["background_source"])
                         merged_summary["background_value"] = float(accepted_region["background_value"])
                         merged_summary["prominence"] = float(accepted_region["prominence"])
                         merged_summary["high_threshold"] = float(accepted_region["high_threshold"])
@@ -1346,13 +1771,82 @@ def _extract_live_component_rois(
             box_blocked_mask[row_min : row_max + 1, col_min : col_max + 1] = True
 
     if accepted_regions:
-        accepted_regions.sort(key=lambda accepted_region: strength_key(score_grid, accepted_region), reverse=True)
+        accepted_regions.sort(key=lambda region: strength_key(score_grid, region), reverse=True)
         non_overlapping_regions: list[dict[str, Any]] = []
         for accepted_region in accepted_regions:
-            if any(boxes_overlap(accepted_region["patch_box"], kept_region["patch_box"]) for kept_region in non_overlapping_regions):
+            if any(
+                boxes_overlap(accepted_region["patch_box"], kept_region["patch_box"])
+                for kept_region in non_overlapping_regions
+            ):
                 continue
             non_overlapping_regions.append(accepted_region)
         accepted_regions = non_overlapping_regions
+
+    hot_mask = valid_mask & (score_grid >= float(image_threshold))
+    uncovered_hot_mask = hot_mask & ~_box_coverage_mask(accepted_regions)
+    if bool(settings.get("coverage_hot_patches", False)) and np.any(uncovered_hot_mask):
+        labeled_components, num_components = nd_label(
+            uncovered_hot_mask.astype(np.uint8),
+            structure=np.ones((3, 3), dtype=np.uint8),
+        )
+        coverage_regions: list[dict[str, Any]] = []
+        for component_id in range(1, int(num_components) + 1):
+            component_mask = labeled_components == component_id
+            if not np.any(component_mask):
+                continue
+            component_scores = score_grid[component_mask]
+            background_value = float(component_scores.min())
+            prominence = float(component_scores.max() - background_value)
+            coverage_regions.append(
+                {
+                    "region_mask": component_mask,
+                    "patch_box": region_box(component_mask),
+                    "background_source": "coverage_hot_component",
+                    "background_value": background_value,
+                    "prominence": prominence,
+                    "high_threshold": float(image_threshold),
+                    "low_threshold": float(image_threshold),
+                    "ring_patch_count": 0,
+                    "proposal_count": 1,
+                    "component_peak_score": float(component_scores.max()),
+                }
+            )
+
+        coverage_regions.sort(
+            key=lambda region: (
+                float(region["component_peak_score"]),
+                int(np.count_nonzero(region["region_mask"])),
+            ),
+            reverse=True,
+        )
+        coverage_merge_gap = int(settings["merge_gap_patches"])
+        for coverage_region in coverage_regions:
+            component_mask = np.asarray(coverage_region["region_mask"], dtype=bool)
+            current_coverage = _box_coverage_mask(accepted_regions)
+            if np.all(current_coverage[component_mask]):
+                continue
+
+            merged_mask = component_mask.copy()
+            contributing_regions = [coverage_region]
+            changed = True
+            while changed:
+                changed = False
+                merged_box = region_box(merged_mask)
+                remaining_regions = []
+                for accepted_region in accepted_regions:
+                    if _patch_box_gap(accepted_region["patch_box"], merged_box) <= coverage_merge_gap:
+                        merged_mask |= np.asarray(accepted_region["region_mask"], dtype=bool)
+                        contributing_regions.append(accepted_region)
+                        changed = True
+                    else:
+                        remaining_regions.append(accepted_region)
+                accepted_regions = remaining_regions
+
+            accepted_regions.append(_merge_region_group(contributing_regions))
+        accepted_regions.sort(key=lambda region: strength_key(score_grid, region), reverse=True)
+
+    if bool(settings.get("final_touch_merge", False)):
+        accepted_regions = _consolidate_regions_by_gap(accepted_regions, gap=0)
 
     max_boxes_per_image = settings["max_boxes_per_image"]
     if max_boxes_per_image is not None:
@@ -1398,9 +1892,12 @@ def _extract_live_component_rois(
                 "primary_peak_score": float(peaks_in_region[0]["peak_score"]) if peaks_in_region else float(score_grid[region_mask].max()),
                 "peak_count_in_region": int(len(peaks_in_region)),
                 "crop_path": "",
+                "roi_extraction_logic": str(roi_logic_key),
             }
         )
     return pd.DataFrame(roi_rows)
+
+
 
 
 def _run_component_test_for_external_image(
@@ -1411,6 +1908,7 @@ def _run_component_test_for_external_image(
     image_rgb: np.ndarray,
     classifier_info: dict[str, Any],
     render_overlays: bool,
+    roi_logic_key: str = DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY,
 ) -> dict[str, Any]:
     experiment_dir = Path(experiment_dir_str).resolve()
     live_config = load_component_test_live_config(
@@ -1513,6 +2011,7 @@ def _run_component_test_for_external_image(
             image_threshold=image_threshold,
             resized_size=resized_size,
             patch_multiple=int(model.patch_size),
+            roi_logic_key=str(roi_logic_key),
         )
         if roi_rows.empty:
             part_label = "NIO_no_roi"
@@ -1556,6 +2055,7 @@ def _run_component_test_for_external_image(
         "note": note,
         "roi_predictions": roi_prediction_rows,
         "overlay_rgb": overlay_rgb,
+        "roi_extraction_logic": str(roi_logic_key),
     }
 
 
@@ -1581,12 +2081,14 @@ def load_multilayer_sample_layers(experiment_dir_str: str, seed: int, sample_nam
 
 
 @st.cache_resource(show_spinner="Lade Boruta-Bauteilklassifikator...")
-def load_boruta_component_classifier_model(
+def load_component_roi_classifier_model(
     experiment_dir_str: str,
+    classifier_subdir: str,
+    classifier_label: str,
     cache_signature: tuple[tuple[str, int, int], ...],
 ) -> dict[str, Any]:
     experiment_dir = Path(experiment_dir_str).resolve()
-    classifier_dir = experiment_dir / BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR
+    classifier_dir = experiment_dir / classifier_subdir
     selection_path = classifier_dir / "selected_features.csv"
     selection_indices_path = classifier_dir / "selected_feature_indices.npy"
     classifier_path = classifier_dir / "classifier_pipeline.joblib"
@@ -1594,7 +2096,7 @@ def load_boruta_component_classifier_model(
     summary_path = classifier_dir / "summary.json"
 
     if not classifier_path.exists():
-        raise FileNotFoundError(f"Boruta-Klassifikator nicht gefunden: {classifier_path}")
+        raise FileNotFoundError(f"{classifier_label}-Klassifikator nicht gefunden: {classifier_path}")
 
     _ = cache_signature
     if selection_indices_path.exists():
@@ -1622,7 +2124,33 @@ def load_boruta_component_classifier_model(
         "summary": summary,
         "selected_feature_count": int(selected_indices.size),
         "classifier_dir": str(classifier_dir),
+        "classifier_label": classifier_label,
+        "classifier_subdir": classifier_subdir,
     }
+
+
+def load_boruta_component_classifier_model(
+    experiment_dir_str: str,
+    cache_signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    return load_component_roi_classifier_model(
+        experiment_dir_str=experiment_dir_str,
+        classifier_subdir=BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+        classifier_label="Boruta",
+        cache_signature=cache_signature,
+    )
+
+
+def load_mrmr_component_classifier_model(
+    experiment_dir_str: str,
+    cache_signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    return load_component_roi_classifier_model(
+        experiment_dir_str=experiment_dir_str,
+        classifier_subdir=MRMR_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+        classifier_label="mRMR",
+        cache_signature=cache_signature,
+    )
 
 
 def _roi_patch_box_to_display_box(
@@ -2622,6 +3150,53 @@ def _save_anomaly_detection_evaluation_artifacts(
     }
 
 
+def _load_anomaly_detection_evaluation_artifacts(
+    experiment_dir_str: str,
+    object_name: str,
+) -> dict[str, Any] | None:
+    evaluation_dir = _anomaly_detection_object_dir(experiment_dir_str, object_name) / "evaluation"
+    scores_path = evaluation_dir / "image_scores.csv"
+    sweep_path = evaluation_dir / "threshold_sweep.csv"
+    summary_path = evaluation_dir / "summary.json"
+    if not scores_path.exists() or not sweep_path.exists() or not summary_path.exists():
+        return None
+
+    score_df = pd.read_csv(scores_path)
+    sweep_df = pd.read_csv(sweep_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if "best_threshold" in summary:
+        best_threshold = float(summary["best_threshold"])
+    elif not sweep_df.empty and "f1" in sweep_df.columns and "threshold" in sweep_df.columns:
+        best_row = sweep_df.sort_values(["f1", "threshold"], ascending=[False, True]).iloc[0]
+        best_threshold = float(best_row["threshold"])
+    else:
+        return None
+
+    run_id = str(summary.get("evaluated_at") or int(summary_path.stat().st_mtime))
+    return {
+        "object_name": object_name,
+        "score_rows": score_df.to_dict(orient="records"),
+        "threshold_sweep_rows": sweep_df.to_dict(orient="records"),
+        "best_threshold": float(best_threshold),
+        "summary": summary,
+        "artifact_paths": {
+            "scores_csv": str(scores_path),
+            "threshold_sweep_csv": str(sweep_path),
+            "summary_json": str(summary_path),
+        },
+        "run_id": run_id,
+    }
+
+
+def _clear_anomaly_detection_evaluation_artifacts(
+    experiment_dir_str: str,
+    object_name: str,
+) -> None:
+    evaluation_dir = _anomaly_detection_object_dir(experiment_dir_str, object_name) / "evaluation"
+    if evaluation_dir.exists():
+        shutil.rmtree(evaluation_dir)
+
+
 def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -> None:
     st.markdown("### Anomaly Detection")
     st.caption(
@@ -2629,8 +3204,19 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
         "ROI-Extraktion und 2D/3D-Klassifikation sind hier bewusst nicht Teil der Evaluierung."
     )
 
+    input_profile_dirs = _anomaly_detection_input_profile_dirs(experiment_dir_str)
+    selected_input_profile = st.selectbox(
+        "Input",
+        options=list(input_profile_dirs.keys()),
+        index=0,
+        key="anomaly_detection_input_profile",
+    )
+    active_experiment_dir_str = str(input_profile_dirs[selected_input_profile])
+    if selected_input_profile == "normalmapalbedo":
+        st.caption("`normalmapalbedo` nutzt aktuell den `buttons`-Fusion-Run.")
+
     try:
-        live_config = load_component_test_live_config(experiment_dir_str, int(seed))
+        live_config = load_component_test_live_config(active_experiment_dir_str, int(seed))
     except Exception as exc:
         st.error(f"Anomaly-Detection-Einstellungen konnten nicht geladen werden: {exc}")
         return
@@ -2644,7 +3230,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
         "Objekt",
         options=object_names,
         index=0,
-        key="anomaly_detection_settings_object",
+        key=f"anomaly_detection_settings_object_{selected_input_profile}",
     )
 
     flash_message = st.session_state.pop(ANOMALY_DETECTION_UPLOAD_FLASH_KEY, "")
@@ -2689,7 +3275,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
         saved_sections: list[str] = []
         if reference_uploads:
             saved_names = _save_uploaded_images_to_category(
-                experiment_dir_str,
+                active_experiment_dir_str,
                 selected_object_name,
                 ANOMALY_DETECTION_REFERENCE_SUBDIR,
                 reference_uploads,
@@ -2697,7 +3283,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
             saved_sections.append(f"Referenzbilder: {len(saved_names)}")
         if test_good_uploads:
             saved_names = _save_uploaded_images_to_category(
-                experiment_dir_str,
+                active_experiment_dir_str,
                 selected_object_name,
                 ANOMALY_DETECTION_TEST_GOOD_SUBDIR,
                 test_good_uploads,
@@ -2705,7 +3291,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
             saved_sections.append(f"Test good: {len(saved_names)}")
         if test_bad_uploads:
             saved_names = _save_uploaded_images_to_category(
-                experiment_dir_str,
+                active_experiment_dir_str,
                 selected_object_name,
                 ANOMALY_DETECTION_TEST_BAD_SUBDIR,
                 test_bad_uploads,
@@ -2715,23 +3301,27 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
         if not saved_sections:
             st.warning("Es wurden keine neuen Bilder hochgeladen.")
         else:
+            _clear_anomaly_detection_evaluation_artifacts(
+                active_experiment_dir_str,
+                selected_object_name,
+            )
             st.session_state.pop(ANOMALY_DETECTION_SETTINGS_VIEW_KEY, None)
             st.session_state[ANOMALY_DETECTION_UPLOAD_NONCE_KEY] = upload_nonce + 1
             st.session_state[ANOMALY_DETECTION_UPLOAD_FLASH_KEY] = "Gespeichert: " + ", ".join(saved_sections)
             st.rerun()
 
     reference_paths = _list_saved_anomaly_detection_images(
-        experiment_dir_str,
+        active_experiment_dir_str,
         selected_object_name,
         ANOMALY_DETECTION_REFERENCE_SUBDIR,
     )
     test_good_paths = _list_saved_anomaly_detection_images(
-        experiment_dir_str,
+        active_experiment_dir_str,
         selected_object_name,
         ANOMALY_DETECTION_TEST_GOOD_SUBDIR,
     )
     test_bad_paths = _list_saved_anomaly_detection_images(
-        experiment_dir_str,
+        active_experiment_dir_str,
         selected_object_name,
         ANOMALY_DETECTION_TEST_BAD_SUBDIR,
     )
@@ -2741,7 +3331,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
     count_cols[1].metric("Test good", str(len(test_good_paths)))
     count_cols[2].metric("Test bad", str(len(test_bad_paths)))
 
-    confirmed_config = load_anomaly_detection_confirmed_config(experiment_dir_str, selected_object_name)
+    confirmed_config = load_anomaly_detection_confirmed_config(active_experiment_dir_str, selected_object_name)
     if confirmed_config is not None:
         st.caption(
             "Aktive bestaetigte Konfiguration: "
@@ -2773,7 +3363,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
 
         try:
             reference_bank = load_anomaly_detection_reference_bank(
-                experiment_dir_str,
+                active_experiment_dir_str,
                 int(seed),
                 selected_object_name,
                 tuple(str(path.resolve()) for path in reference_paths),
@@ -2796,7 +3386,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
             try:
                 image_rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
                 score_result = _score_image_for_live_anomaly_detection(
-                    experiment_dir_str,
+                    active_experiment_dir_str,
                     int(seed),
                     selected_object_name,
                     image_rgb,
@@ -2864,7 +3454,7 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
             "evaluated_at": datetime.now().isoformat(timespec="seconds"),
         }
         artifact_paths = _save_anomaly_detection_evaluation_artifacts(
-            experiment_dir_str,
+            active_experiment_dir_str,
             selected_object_name,
             score_df,
             sweep_df,
@@ -2873,6 +3463,8 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
 
         st.session_state[ANOMALY_DETECTION_SETTINGS_VIEW_KEY] = {
             "object_name": selected_object_name,
+            "experiment_dir": active_experiment_dir_str,
+            "input_profile": selected_input_profile,
             "score_rows": score_df.to_dict(orient="records"),
             "threshold_sweep_rows": sweep_df.to_dict(orient="records"),
             "best_threshold": float(best_threshold),
@@ -2886,7 +3478,24 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
         )
 
     stored = st.session_state.get(ANOMALY_DETECTION_SETTINGS_VIEW_KEY)
-    if not stored or stored.get("object_name") != selected_object_name:
+    stored_matches = bool(
+        stored
+        and stored.get("object_name") == selected_object_name
+        and stored.get("experiment_dir") == active_experiment_dir_str
+        and stored.get("input_profile") == selected_input_profile
+    )
+    if not stored_matches:
+        persisted = _load_anomaly_detection_evaluation_artifacts(
+            active_experiment_dir_str,
+            selected_object_name,
+        )
+        if persisted is not None:
+            persisted["experiment_dir"] = active_experiment_dir_str
+            persisted["input_profile"] = selected_input_profile
+            st.session_state[ANOMALY_DETECTION_SETTINGS_VIEW_KEY] = persisted
+            stored = persisted
+            stored_matches = True
+    if not stored_matches:
         return
 
     score_df = pd.DataFrame(stored["score_rows"])
@@ -2968,11 +3577,11 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
     confirm_threshold = st.button(
         "Diesen Threshold übernehmen",
         use_container_width=True,
-        key=f"anomaly_detection_confirm_button_{selected_object_name}_{stored['run_id']}",
+        key=f"anomaly_detection_confirm_button_{selected_input_profile}_{selected_object_name}_{stored['run_id']}",
     )
     if confirm_threshold:
         config_path = _save_anomaly_detection_confirmed_config(
-            experiment_dir_str=experiment_dir_str,
+            experiment_dir_str=active_experiment_dir_str,
             object_name=selected_object_name,
             threshold=float(current_threshold),
             reference_paths=reference_paths,
@@ -3038,19 +3647,390 @@ def render_anomaly_detection_settings_mode(experiment_dir_str: str, seed: int) -
         )
 
 
+def render_test_dataset_mode(experiment_dir_str: str, seed: int) -> None:
+    st.markdown("### Testdatensatz")
+    st.caption(
+        "Hier labelst du Testbilder auf Bauteilebene und evaluierst danach den End-to-End-Lauf "
+        "mit den aktuell bestätigten Anomaly-Detection-Einstellungen."
+    )
+
+    try:
+        live_config = load_component_test_live_config(experiment_dir_str, int(seed))
+    except Exception as exc:
+        st.error(f"Testdatensatz-Kontext konnte nicht geladen werden: {exc}")
+        return
+
+    object_names = list(live_config.get("object_names", []))
+    if not object_names:
+        st.warning("Im aktuellen Run wurden keine Objekte gefunden.")
+        return
+
+    selected_object_name = st.selectbox(
+        "Objekt",
+        options=object_names,
+        index=0,
+        key="test_dataset_object",
+    )
+
+    upload_flash = st.session_state.pop(TEST_DATASET_UPLOAD_FLASH_KEY, "")
+    if upload_flash:
+        st.success(str(upload_flash))
+
+    test_tabs = st.tabs(["Labeling", "Evaluierung"])
+
+    with test_tabs[0]:
+        upload_nonce = int(st.session_state.get(TEST_DATASET_UPLOAD_NONCE_KEY, 0))
+        with st.form("test_dataset_upload_form"):
+            st.caption(
+                "Neue Uploads werden dem Testdatensatz hinzugefügt. "
+                "Wenn mehrere Bilder zum selben Bauteil gehören, gib ihnen später dieselbe `part_id`."
+            )
+            dataset_uploads = st.file_uploader(
+                "Testbilder hochladen",
+                type=COMPONENT_TEST_UPLOAD_EXTENSIONS,
+                accept_multiple_files=True,
+                key=f"test_dataset_uploads_{upload_nonce}",
+            )
+            save_dataset_uploads = st.form_submit_button("Testbilder speichern", use_container_width=True)
+
+        if save_dataset_uploads:
+            if not dataset_uploads:
+                st.warning("Es wurden keine neuen Testbilder hochgeladen.")
+            else:
+                saved_names = _save_uploaded_test_dataset_images(
+                    experiment_dir_str,
+                    selected_object_name,
+                    dataset_uploads,
+                )
+                _sync_test_dataset_manifest_with_images(
+                    experiment_dir_str,
+                    selected_object_name,
+                    saved_names,
+                )
+                st.session_state.pop(TEST_DATASET_VIEW_KEY, None)
+                st.session_state[TEST_DATASET_UPLOAD_NONCE_KEY] = upload_nonce + 1
+                st.session_state[TEST_DATASET_UPLOAD_FLASH_KEY] = (
+                    f"Gespeichert: {len(saved_names)} Testbild(er)"
+                )
+                st.rerun()
+
+        manifest_df = load_test_dataset_manifest(experiment_dir_str, selected_object_name)
+        image_paths = _list_test_dataset_images(experiment_dir_str, selected_object_name)
+        existing_names = {path.name for path in image_paths}
+        manifest_df = manifest_df.loc[manifest_df["image_filename"].astype(str).isin(existing_names)].copy()
+
+        total_images = int(manifest_df.shape[0])
+        labeled_images = int(np.sum(manifest_df["gt_part_label"].astype(str).isin(["IO", "2D", "3D"])))
+        unlabeled_images = int(total_images - labeled_images)
+        label_count_cols = st.columns(3)
+        label_count_cols[0].metric("Bilder", str(total_images))
+        label_count_cols[1].metric("Gelabelt", str(labeled_images))
+        label_count_cols[2].metric("Ungelabelt", str(unlabeled_images))
+
+        if manifest_df.empty:
+            st.info("Noch keine Testbilder gespeichert.")
+        else:
+            only_unlabeled = st.checkbox("Nur ungelabelte zeigen", value=False, key="test_dataset_only_unlabeled")
+            candidate_df = manifest_df.copy()
+            if only_unlabeled:
+                candidate_df = candidate_df.loc[~candidate_df["gt_part_label"].astype(str).isin(["IO", "2D", "3D"])].copy()
+
+            if candidate_df.empty:
+                st.caption("Für den aktuellen Filter gibt es keine Bilder.")
+            else:
+                image_options = candidate_df["image_filename"].astype(str).tolist()
+                selected_image_filename = st.selectbox(
+                    "Bild",
+                    options=image_options,
+                    index=0,
+                    key="test_dataset_selected_image",
+                )
+                current_row = manifest_df.loc[
+                    manifest_df["image_filename"].astype(str) == selected_image_filename
+                ].iloc[0]
+                image_path = _test_dataset_images_dir(experiment_dir_str, selected_object_name) / selected_image_filename
+                image_rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+                st.image(image_rgb, caption=selected_image_filename, use_container_width=True)
+
+                label_options = ["", "IO", "2D", "3D"]
+                current_label = str(current_row["gt_part_label"])
+                current_label_index = label_options.index(current_label) if current_label in label_options else 0
+
+                with st.form("test_dataset_label_form"):
+                    part_id = st.text_input(
+                        "part_id",
+                        value=str(current_row["part_id"]) if str(current_row["part_id"]) else str(Path(selected_image_filename).stem),
+                        help="Mehrere Bilder mit derselben part_id werden in der Evaluierung zu einem Bauteil zusammengefasst.",
+                    )
+                    gt_part_label = st.selectbox(
+                        "Bauteil-Label",
+                        options=label_options,
+                        index=current_label_index,
+                    )
+                    note = st.text_area("Notiz", value=str(current_row["note"]))
+                    save_label = st.form_submit_button("Label speichern", use_container_width=True)
+
+                if save_label:
+                    if not str(part_id).strip():
+                        st.warning("part_id darf nicht leer sein.")
+                    else:
+                        _update_test_dataset_label(
+                            experiment_dir_str=experiment_dir_str,
+                            object_name=selected_object_name,
+                            image_filename=selected_image_filename,
+                            part_id=str(part_id).strip(),
+                            gt_part_label=str(gt_part_label).strip(),
+                            note=str(note),
+                        )
+                        st.success(f"Label für {selected_image_filename} gespeichert.")
+                        st.rerun()
+
+            st.dataframe(manifest_df, use_container_width=True, hide_index=True)
+
+    with test_tabs[1]:
+        confirmed_config = load_anomaly_detection_confirmed_config(experiment_dir_str, selected_object_name)
+        if confirmed_config is None:
+            st.warning(
+                "Für dieses Objekt gibt es noch keine bestätigte Anomaly-Detection-Konfiguration. "
+                "Bestätige zuerst unter `Anomaly Detection` einen Threshold."
+            )
+            return
+
+        try:
+            confirmed_reference_paths = _resolve_confirmed_reference_paths(
+                experiment_dir_str,
+                selected_object_name,
+                confirmed_config,
+            )
+        except Exception as exc:
+            st.error(f"Bestaetigte Referenzkonfiguration ist ungueltig: {exc}")
+            return
+
+        st.caption(
+            f"Aktive Anomaly-Detection-Konfiguration: Threshold={float(confirmed_config['threshold']):.6f} | "
+            f"Referenzbilder={len(confirmed_reference_paths)}"
+        )
+
+        classifier_choice = st.selectbox(
+            "ROI-Klassifikator",
+            options=["Boruta", "mRMR"],
+            index=0,
+            key="test_dataset_classifier_choice",
+        )
+
+        with st.form("test_dataset_evaluation_form"):
+            st.caption(
+                "Die Evaluierung nutzt die aktuell bestätigten Referenzbilder und den aktuell bestätigten "
+                "Bildthreshold aus `Anomaly Detection`."
+            )
+            start_dataset_evaluation = st.form_submit_button("Test-Evaluierung starten", use_container_width=True)
+
+        if start_dataset_evaluation:
+            manifest_df = load_test_dataset_manifest(experiment_dir_str, selected_object_name)
+            image_paths = _list_test_dataset_images(experiment_dir_str, selected_object_name)
+            available_names = {path.name for path in image_paths}
+            manifest_df = manifest_df.loc[
+                manifest_df["image_filename"].astype(str).isin(available_names)
+                & manifest_df["gt_part_label"].astype(str).isin(["IO", "2D", "3D"])
+            ].copy()
+
+            if manifest_df.empty:
+                st.warning("Es gibt keine vollständig gelabelten Testbilder für die Evaluierung.")
+                return
+
+            try:
+                load_component_test_backbone(experiment_dir_str)
+                reference_bank = load_anomaly_detection_reference_bank(
+                    experiment_dir_str,
+                    int(seed),
+                    selected_object_name,
+                    tuple(str(path.resolve()) for path in confirmed_reference_paths),
+                    _file_signature_from_paths(confirmed_reference_paths),
+                )
+                classifier_info = _load_selected_component_classifier(experiment_dir_str, classifier_choice)
+            except Exception as exc:
+                st.error(f"Evaluierung konnte nicht vorbereitet werden: {exc}")
+                return
+
+            progress_bar = st.progress(0.0)
+            status_box = st.empty()
+            image_result_rows: list[dict[str, Any]] = []
+            image_dir = _test_dataset_images_dir(experiment_dir_str, selected_object_name)
+            threshold_value = float(confirmed_config["threshold"])
+
+            for index, row in enumerate(manifest_df.itertuples(index=False), start=1):
+                status_box.info(f"Evaluiere {index}/{manifest_df.shape[0]}: {row.image_filename}")
+                image_path = image_dir / str(row.image_filename)
+                try:
+                    image_rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+                    result = _run_component_test_for_external_image(
+                        experiment_dir_str=experiment_dir_str,
+                        seed=int(seed),
+                        object_name=selected_object_name,
+                        sample_name=str(row.image_filename),
+                        image_rgb=image_rgb,
+                        classifier_info=classifier_info,
+                        render_overlays=False,
+                    )
+                    image_result_rows.append(
+                        {
+                            "part_id": str(row.part_id),
+                            "image_filename": str(row.image_filename),
+                            "gt_part_label": str(row.gt_part_label),
+                            "raw_pred_part_label": str(result["part_label"]),
+                            "pred_part_label": _normalize_image_level_part_prediction(result["part_label"]),
+                            "image_score": float(result["image_score"]),
+                            "image_threshold": float(threshold_value),
+                            "io_nio": str(result["io_nio"]),
+                            "num_rois": int(result["num_rois"]),
+                            "num_3d_rois": int(result["num_3d_rois"]),
+                            "max_roi_p3d": float(result["max_roi_p3d"]),
+                            "note": str(result["note"]),
+                        }
+                    )
+                except Exception as exc:
+                    image_result_rows.append(
+                        {
+                            "part_id": str(row.part_id),
+                            "image_filename": str(row.image_filename),
+                            "gt_part_label": str(row.gt_part_label),
+                            "raw_pred_part_label": "ERROR",
+                            "pred_part_label": "ERROR",
+                            "image_score": float("nan"),
+                            "image_threshold": float(threshold_value),
+                            "io_nio": "ERROR",
+                            "num_rois": 0,
+                            "num_3d_rois": 0,
+                            "max_roi_p3d": 0.0,
+                            "note": f"Evaluierungsfehler: {exc}",
+                        }
+                    )
+                progress_bar.progress(index / float(manifest_df.shape[0]))
+
+            status_box.empty()
+            progress_bar.empty()
+
+            image_result_df = pd.DataFrame(image_result_rows)
+            valid_image_result_df = image_result_df.loc[
+                image_result_df["pred_part_label"].astype(str).isin(["IO", "2D", "3D"])
+            ].copy()
+            if valid_image_result_df.empty:
+                st.error("Keine gültigen Vorhersagen für die Test-Evaluierung erhalten.")
+                return
+
+            part_result_df = _aggregate_part_level_predictions(valid_image_result_df.to_dict(orient="records"))
+            part_metrics = _compute_three_class_metrics(
+                part_result_df["gt_part_label"].astype(str).tolist(),
+                part_result_df["pred_part_label"].astype(str).tolist(),
+            )
+            summary = {
+                "object_name": selected_object_name,
+                "classifier_choice": classifier_choice,
+                "confirmed_threshold": float(threshold_value),
+                "num_reference_images": int(len(confirmed_reference_paths)),
+                "num_test_images": int(valid_image_result_df.shape[0]),
+                "num_parts": int(part_result_df.shape[0]),
+                "accuracy": float(part_metrics["accuracy"]),
+                "macro_precision": float(part_metrics["macro_precision"]),
+                "macro_recall": float(part_metrics["macro_recall"]),
+                "macro_f1": float(part_metrics["macro_f1"]),
+                "per_class": part_metrics["per_class"],
+                "labels": part_metrics["labels"],
+                "confusion_matrix": part_metrics["confusion_matrix"],
+            }
+            artifact_paths = _save_test_dataset_evaluation_artifacts(
+                experiment_dir_str=experiment_dir_str,
+                object_name=selected_object_name,
+                classifier_choice=classifier_choice,
+                image_result_df=image_result_df,
+                part_result_df=part_result_df,
+                summary=summary,
+            )
+
+            st.session_state[TEST_DATASET_VIEW_KEY] = {
+                "object_name": selected_object_name,
+                "classifier_choice": classifier_choice,
+                "summary": summary,
+                "image_result_rows": image_result_df.to_dict(orient="records"),
+                "part_result_rows": part_result_df.to_dict(orient="records"),
+                "artifact_paths": artifact_paths,
+            }
+            st.success(
+                f"Test-Evaluierung abgeschlossen: Macro F1={float(summary['macro_f1']) * 100:.1f}% "
+                f"auf {int(summary['num_parts'])} Bauteilen."
+            )
+
+        stored = st.session_state.get(TEST_DATASET_VIEW_KEY)
+        if not stored:
+            return
+        if stored.get("object_name") != selected_object_name or stored.get("classifier_choice") != classifier_choice:
+            return
+
+        summary = dict(stored["summary"])
+        image_result_df = pd.DataFrame(stored["image_result_rows"])
+        part_result_df = pd.DataFrame(stored["part_result_rows"])
+        artifact_paths = dict(stored.get("artifact_paths", {}))
+
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Accuracy", f"{float(summary['accuracy']) * 100:.1f}%")
+        metric_cols[1].metric("Macro Precision", f"{float(summary['macro_precision']) * 100:.1f}%")
+        metric_cols[2].metric("Macro Recall", f"{float(summary['macro_recall']) * 100:.1f}%")
+        metric_cols[3].metric("Macro F1", f"{float(summary['macro_f1']) * 100:.1f}%")
+        metric_cols[4].metric("Bauteile", str(int(summary["num_parts"])))
+
+        per_class = summary.get("per_class", {})
+        per_class_rows = []
+        for label in ["IO", "2D", "3D"]:
+            class_metrics = per_class.get(label, {})
+            per_class_rows.append(
+                {
+                    "label": label,
+                    "precision": float(class_metrics.get("precision", 0.0)),
+                    "recall": float(class_metrics.get("recall", 0.0)),
+                    "f1": float(class_metrics.get("f1", 0.0)),
+                    "support": int(class_metrics.get("support", 0)),
+                }
+            )
+        st.dataframe(pd.DataFrame(per_class_rows), use_container_width=True, hide_index=True)
+
+        labels = list(summary.get("labels", ["IO", "2D", "3D"]))
+        conf_df = pd.DataFrame(
+            np.asarray(summary.get("confusion_matrix", np.zeros((3, 3), dtype=int))),
+            index=[f"gt_{label}" for label in labels],
+            columns=[f"pred_{label}" for label in labels],
+        )
+        st.dataframe(conf_df, use_container_width=True)
+
+        with st.expander("Bauteil-Vorhersagen", expanded=False):
+            st.dataframe(part_result_df, use_container_width=True, hide_index=True)
+        with st.expander("Bild-Vorhersagen", expanded=False):
+            st.dataframe(image_result_df, use_container_width=True, hide_index=True)
+
+        if artifact_paths:
+            st.caption(
+                "Artefakte: "
+                f"dir={artifact_paths.get('evaluation_dir', '')} | "
+                f"part={artifact_paths.get('predictions_part_level_csv', '')} | "
+                f"image={artifact_paths.get('predictions_image_level_csv', '')} | "
+                f"summary={artifact_paths.get('summary_json', '')}"
+            )
+
+
 def render_settings_mode(context: dict[str, Any], experiment_dir_str: str, seed: int) -> None:
     _ = context
     st.subheader("Einstellungen")
-    settings_tabs = st.tabs(["Anomaly Detection"])
+    settings_tabs = st.tabs(["Anomaly Detection", "Testdatensatz"])
     with settings_tabs[0]:
         render_anomaly_detection_settings_mode(experiment_dir_str, seed)
+    with settings_tabs[1]:
+        render_test_dataset_mode(experiment_dir_str, seed)
 
 
 def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str, seed: int) -> None:
     st.subheader("Bauteil-Test")
     st.caption(
         "Der Bauteil-Test kann vorhandene Run-Bilder verwenden oder externe Bilder mit frischer "
-        "End-to-End-Inferenz durch AnomalyDINO, ROI-Extraktion und Boruta-Klassifikation schicken."
+        "End-to-End-Inferenz durch AnomalyDINO, ROI-Extraktion und ROI-Klassifikation schicken."
     )
 
     sample_rows = context["samples"]
@@ -3064,24 +4044,16 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
 
     selected_samples: list[str] = []
     selected_object_name = ""
+    selected_roi_logic_key = DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY
+    classifier_choice = "Boruta"
     uploaded_files = []
     live_config: dict[str, Any] | None = None
     if source_mode == "Externe Uploads":
         try:
-            experiment_dir = Path(experiment_dir_str).resolve()
-            data_root = Path(str(load_run_args(experiment_dir).get("data_root", ""))).resolve()
-            run_object_names = sorted({sample.object_name for sample in load_run_samples(experiment_dir, seed=int(seed))})
-            train_good_signatures = tuple(
-                (
-                    object_name,
-                    _directory_file_signature(data_root / object_name / "train" / "good"),
-                )
-                for object_name in run_object_names
-            )
             live_config = load_component_test_live_config(
                 experiment_dir_str,
                 int(seed),
-                train_good_signatures=train_good_signatures,
+                train_good_signatures=tuple(),
             )
         except Exception as exc:
             st.error(f"Live-Inferenz konnte nicht vorbereitet werden: {exc}")
@@ -3144,10 +4116,40 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         f"Threshold={object_threshold:.6f} | Referenzbilder={ref_count} | Quelle={source_label}"
                     )
         with option_col:
+            classifier_choice = st.selectbox(
+                "ROI-Klassifikator",
+                options=["Boruta", "mRMR"],
+                index=0,
+                key="component_test_classifier_choice",
+            )
+            st.caption("Boruta und mRMR nutzen beide die gleiche min/max/mean-ROI-Featurelogik.")
             render_overlays = st.checkbox("Overlays rendern", value=False, key="component_test_render_overlays")
             if source_mode == "Run-Bilder":
                 st.caption("Wenn aktiv, werden pro Bild ROI-Boxen mit 2D/3D-Labels direkt in der App gerendert.")
             else:
+                roi_logic_keys = list(COMPONENT_TEST_ROI_LOGIC_PROFILES.keys())
+                default_roi_logic_key = (
+                    "buttons_new"
+                    if str(selected_object_name).lower() == "buttons"
+                    else "normalmap_old"
+                )
+                default_roi_logic_index = (
+                    roi_logic_keys.index(default_roi_logic_key)
+                    if default_roi_logic_key in roi_logic_keys
+                    else roi_logic_keys.index(DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY)
+                )
+                selected_roi_logic_label = st.selectbox(
+                    "ROI-Extraktion",
+                    options=[COMPONENT_TEST_ROI_LOGIC_PROFILES[key]["label"] for key in roi_logic_keys],
+                    index=default_roi_logic_index,
+                    key="component_test_roi_logic_label",
+                )
+                selected_roi_logic_key = next(
+                    key
+                    for key in roi_logic_keys
+                    if COMPONENT_TEST_ROI_LOGIC_PROFILES[key]["label"] == selected_roi_logic_label
+                )
+                st.caption(str(COMPONENT_TEST_ROI_LOGIC_PROFILES[selected_roi_logic_key]["description"]))
                 st.caption(
                     "Frische Inferenz laedt den Backbone, baut die Referenzbank und extrahiert danach "
                     "ROIs fuer jedes hochgeladene Bild."
@@ -3155,16 +4157,8 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
         start_test = st.form_submit_button("Test starten", use_container_width=True)
 
     if start_test:
-        classifier_dir = Path(experiment_dir_str).resolve() / BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR
-        cache_signature = _classifier_file_signature(
-            classifier_dir / "selected_features.csv",
-            classifier_dir / "selected_feature_indices.npy",
-            classifier_dir / "classifier_pipeline.joblib",
-            classifier_dir / "model_info.json",
-            classifier_dir / "summary.json",
-        )
         try:
-            classifier_info = load_boruta_component_classifier_model(experiment_dir_str, cache_signature)
+            classifier_info = _load_selected_component_classifier(experiment_dir_str, classifier_choice)
         except Exception as exc:
             st.error(f"Bauteil-Test konnte nicht initialisiert werden: {exc}")
             return
@@ -3247,6 +4241,7 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         image_rgb=image_rgb,
                         classifier_info=classifier_info,
                         render_overlays=bool(render_overlays),
+                        roi_logic_key=str(selected_roi_logic_key),
                     )
                 except Exception as exc:
                     result = {
@@ -3265,6 +4260,7 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         "note": f"Fehler in frischer Inferenz: {exc}",
                         "roi_predictions": [],
                         "overlay_rgb": None,
+                        "roi_extraction_logic": str(selected_roi_logic_key),
                     }
                 results.append(result)
                 progress_bar.progress(index / float(total))
@@ -3273,6 +4269,7 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
         st.session_state[COMPONENT_TEST_VIEW_KEY] = {
             "results": results,
             "render_overlays": bool(render_overlays),
+            "classifier_choice": str(classifier_choice),
         }
 
     stored = st.session_state.get(COMPONENT_TEST_VIEW_KEY)
@@ -3281,10 +4278,13 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
 
     results = list(stored["results"])
     render_overlays = bool(stored["render_overlays"])
+    stored_classifier_choice = str(stored.get("classifier_choice", ""))
     summary_rows = [
         {
             "sample": row["sample"],
             "group": row["evaluation_group"],
+            "classifier": stored_classifier_choice,
+            "roi_extraction_logic": row.get("roi_extraction_logic", ""),
             "image_score": row["image_score"],
             "image_threshold": row["image_threshold"],
             "anomalous_patches": row["anomalous_patch_count"],
@@ -3334,16 +4334,28 @@ def main() -> None:
     experiment_dir_str = st.sidebar.text_input("Experiment Directory", value=default_experiment_dir)
     seed = st.sidebar.number_input("Seed", min_value=0, max_value=999, value=0, step=1)
 
+    context_load_error: Exception | None = None
     try:
         context = load_run_context(experiment_dir_str, int(seed))
     except Exception as exc:
-        st.error(f"Run konnte nicht geladen werden: {exc}")
-        return
+        context_load_error = exc
+        context = {
+            "experiment_dir": str(Path(experiment_dir_str).resolve()),
+            "run_args": {},
+            "samples": [],
+            "sample_index": {},
+        }
+        st.warning(
+            "Der vollstaendige Run-Kontext konnte nicht geladen werden. "
+            "Cache-abhaengige Ansichten wie `Similarity Explorer` und `Bauteil-Test` fuer vorhandene Run-Bilder "
+            "benoetigen die separat bereitgestellten Feature- und Anomaly-Map-Caches. "
+            f"Details: {exc}"
+        )
 
     view_mode = st.radio(
         "Ansicht",
         options=["Similarity Explorer", "Bauteil-Test", "Einstellungen"],
-        index=0,
+        index=2 if context_load_error is not None else 0,
         horizontal=True,
     )
     if view_mode == "Bauteil-Test":
@@ -3351,6 +4363,13 @@ def main() -> None:
         return
     if view_mode == "Einstellungen":
         render_settings_mode(context, experiment_dir_str, int(seed))
+        return
+
+    if context_load_error is not None:
+        st.info(
+            "`Similarity Explorer` ist in diesem reduzierten GitHub-Stand erst nutzbar, "
+            "wenn die externen Feature-Caches und Anomaly-Maps in den Experimentordner gelegt wurden."
+        )
         return
 
     sample_rows = context["samples"]

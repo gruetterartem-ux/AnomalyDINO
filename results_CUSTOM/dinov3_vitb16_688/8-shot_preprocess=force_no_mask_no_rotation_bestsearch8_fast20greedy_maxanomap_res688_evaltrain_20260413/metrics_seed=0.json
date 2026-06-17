@@ -1,0 +1,11 @@
+{
+    "normalmap": {
+        "classification_AUROC": 0.9019136988325698,
+        "classification_AP": 0.873439854228398,
+        "classification_F1": 0.7987012987012988,
+        "classification_threshold": 0.05689969235378277
+    },
+    "mean_classification_au_roc": 0.9019136988325698,
+    "mean_classification_ap": 0.873439854228398,
+    "mean_classification_f1": 0.7987012987012988
+}

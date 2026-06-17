@@ -63,7 +63,9 @@ Lokale Streamlit-App fuer dense Patch-Aehnlichkeit und Bauteil-Tests auf dem bes
     - DINOv3-Backbone laden
     - Referenzbank aus den gespeicherten Few-Shot-Referenzbildern des Runs aufbauen
     - frische Patch-Anomaliescores berechnen
-    - ROI-Boxen mit derselben Hysterese-/Merge-Logik wie im Training extrahieren
+    - ROI-Boxen mit waehlbarer Extraktionslogik erzeugen:
+      - `Alte Normalmap-Logik`: klassische Hysterese mit `merge_gap=3`
+      - `Neue Buttons-Logik`: Hysterese mit `merge_gap=1`, Coverage-Pass und Touch-Merge
     - danach das finale `Boruta + RBF-SVM`-Endmodell pro ROI anwenden
   - nutzt fuer die ROI-Klassifikation das finale `Boruta + RBF-SVM`-Endmodell
   - entscheidet pro Bild erst `IO/NIO`, danach pro ROI `2D/3D` und am Ende auf Bauteilebene:
@@ -72,6 +74,10 @@ Lokale Streamlit-App fuer dense Patch-Aehnlichkeit und Bauteil-Tests auf dem bes
   - rendert Overlays nur, wenn die Checkbox dafuer gesetzt wird
 - zusaetzlich gibt es die Ansicht `Einstellungen`
   - mit dem Reiter `Anomaly Detection`
+  - dort kann fuer die frische AnomalyDINO-Evaluierung zwischen zwei Inputs gewechselt werden:
+    - `normalmap`
+    - `normalmapalbedo`
+  - `normalmapalbedo` nutzt aktuell den `buttons`-Fusion-Run
   - dort koennen pro Objekt gespeichert werden:
     - `Referenzbilder`
     - `Testbilder good`
@@ -91,17 +97,42 @@ Lokale Streamlit-App fuer dense Patch-Aehnlichkeit und Bauteil-Tests auf dem bes
     - bestaetigter `Bildthreshold`
     - bestaetigte Referenzbilder
   - diese Seite bewertet bewusst nur `IO/NIO` auf Bildebene und nicht ROI- oder `2D/3D`-Klassifikation
+  - mit dem Reiter `Testdatensatz`
+    - Testbilder koennen lokal fuer ein Objekt gespeichert werden
+    - pro Bild werden auf Bauteilebene gepflegt:
+      - `part_id`
+      - `gt_part_label` in `IO`, `2D`, `3D`
+      - optionale Notiz
+    - mehrere Bilder mit derselben `part_id` werden in der Evaluierung zu einem Bauteil aggregiert
+    - die Test-Evaluierung nutzt bewusst die aktuell bestaetigte `Anomaly Detection`-Konfiguration:
+      - aktuelle Referenzbilder
+      - aktueller bestaetigter Bildthreshold
+    - als ROI-Klassifikator kann zwischen
+      - `Boruta`
+      - `mRMR`
+      gewaehlt werden
+    - gespeichert werden:
+      - Bildvorhersagen
+      - Bauteilvorhersagen
+      - Summary mit `Accuracy`, `Macro Precision`, `Macro Recall`, `Macro F1`
 
 ## Start
 
+Abhaengigkeiten fuer die App installieren:
+
 ```powershell
-C:\ai\AnomalyDINO\.venvAnomalyDINO\Scripts\python.exe -m streamlit run C:\ai\AnomalyDINO\anomalydino_similarity_app\app.py
+pip install -r .\anomalydino_similarity_app\requirements_app.txt
+```
+
+```powershell
+cd <repo-root>
+python -m streamlit run .\anomalydino_similarity_app\app.py
 ```
 
 Optional mit explizitem Experiment-Ordner:
 
 ```powershell
-C:\ai\AnomalyDINO\.venvAnomalyDINO\Scripts\python.exe -m streamlit run C:\ai\AnomalyDINO\anomalydino_similarity_app\app.py -- "C:\ai\AnomalyDINO\results_CUSTOM\dinov3_vitb16_688\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413"
+python -m streamlit run .\anomalydino_similarity_app\app.py -- ".\results_CUSTOM\dinov3_vitb16_688\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413"
 ```
 
 Dann im Browser:
@@ -112,7 +143,19 @@ http://localhost:8501
 
 ## Voraussetzung
 
-Der Run muss enthalten:
+Der GitHub-Stand enthaelt die kleinen finalen App-Artefakte:
+
+- `app_settings/anomaly_detection/normalmap/confirmed_threshold_config.json`
+- `final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf/classifier_pipeline.joblib`
+- `final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf/selected_feature_indices.npy`
+- `final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf/selected_features.csv`
+- `final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf/model_info.json`
+- `final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf/classifier_pipeline.joblib`
+- `final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf/selected_feature_indices.npy`
+- `final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf/selected_features.csv`
+- `final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf/model_info.json`
+
+Fuer eine frische End-to-End-Inferenz muessen zusaetzlich die grossen Daten- und Cache-Artefakte lokal vorhanden sein. Diese werden nicht in Git versioniert:
 
 - `anomaly_maps/seed=0/.../*.npy`
 - `patch_feature_cache/seed=0/cache_manifest.csv`
