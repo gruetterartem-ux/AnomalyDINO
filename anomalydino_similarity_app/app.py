@@ -145,24 +145,11 @@ COMPONENT_TEST_ROI_SETTINGS = {
     "coverage_hot_patches": True,
     "final_touch_merge": True,
 }
-COMPONENT_TEST_ROI_LOGIC_PROFILES = {
-    "buttons_new": {
-        "label": "Neue Buttons-Logik",
-        "description": "gap=1, Coverage-Pass fuer Hot-Patches, finaler Touch-Merge",
-        "settings": COMPONENT_TEST_ROI_SETTINGS,
-    },
-    "normalmap_old": {
-        "label": "Alte Normalmap-Logik",
-        "description": "klassische Hysterese-Extraktion mit gap=3 ohne Coverage-Pass",
-        "settings": {
-            **COMPONENT_TEST_ROI_SETTINGS,
-            "merge_gap_patches": 3,
-            "coverage_hot_patches": False,
-            "final_touch_merge": False,
-        },
-    },
-}
 DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY = "buttons_new"
+COMPONENT_CLASSIFIER_LABELS = {
+    "Boruta": "SVM-RBF mit Boruta Merkmalen",
+    "mRMR": "SVM-RBF mit mRMR Merkmalen",
+}
 
 
 def _parse_experiment_dir_from_argv() -> str:
@@ -1162,6 +1149,10 @@ def _load_selected_component_classifier(experiment_dir_str: str, classifier_choi
     raise ValueError(f"Unbekannter Klassifikator: {classifier_choice}")
 
 
+def _format_component_classifier_choice(classifier_choice: str) -> str:
+    return COMPONENT_CLASSIFIER_LABELS.get(str(classifier_choice), str(classifier_choice))
+
+
 def _normalize_image_level_part_prediction(raw_part_label: str) -> str:
     label = str(raw_part_label)
     if label in {"IO", "2D", "3D"}:
@@ -1655,11 +1646,7 @@ def _extract_live_component_rois(
         return consolidated_regions
 
     valid_mask = score_grid > 0.0
-    profile = COMPONENT_TEST_ROI_LOGIC_PROFILES.get(
-        str(roi_logic_key),
-        COMPONENT_TEST_ROI_LOGIC_PROFILES[DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY],
-    )
-    settings = dict(profile["settings"])
+    settings = dict(COMPONENT_TEST_ROI_SETTINGS)
     consumed_mask = np.zeros_like(valid_mask, dtype=bool)
     rejected_mask = np.zeros_like(valid_mask, dtype=bool)
     box_blocked_mask = np.zeros_like(valid_mask, dtype=bool)
@@ -3816,6 +3803,7 @@ def render_test_dataset_mode(experiment_dir_str: str, seed: int) -> None:
             options=["Boruta", "mRMR"],
             index=0,
             key="test_dataset_classifier_choice",
+            format_func=_format_component_classifier_choice,
         )
 
         with st.form("test_dataset_evaluation_form"):
@@ -4121,35 +4109,15 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                 options=["Boruta", "mRMR"],
                 index=0,
                 key="component_test_classifier_choice",
+                format_func=_format_component_classifier_choice,
             )
-            st.caption("Boruta und mRMR nutzen beide die gleiche min/max/mean-ROI-Featurelogik.")
+            st.caption("Beide Optionen nutzen RBF-SVMs mit derselben min/max/mean-ROI-Featurelogik.")
             render_overlays = st.checkbox("Overlays rendern", value=False, key="component_test_render_overlays")
             if source_mode == "Run-Bilder":
                 st.caption("Wenn aktiv, werden pro Bild ROI-Boxen mit 2D/3D-Labels direkt in der App gerendert.")
             else:
-                roi_logic_keys = list(COMPONENT_TEST_ROI_LOGIC_PROFILES.keys())
-                default_roi_logic_key = (
-                    "buttons_new"
-                    if str(selected_object_name).lower() == "buttons"
-                    else "normalmap_old"
-                )
-                default_roi_logic_index = (
-                    roi_logic_keys.index(default_roi_logic_key)
-                    if default_roi_logic_key in roi_logic_keys
-                    else roi_logic_keys.index(DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY)
-                )
-                selected_roi_logic_label = st.selectbox(
-                    "ROI-Extraktion",
-                    options=[COMPONENT_TEST_ROI_LOGIC_PROFILES[key]["label"] for key in roi_logic_keys],
-                    index=default_roi_logic_index,
-                    key="component_test_roi_logic_label",
-                )
-                selected_roi_logic_key = next(
-                    key
-                    for key in roi_logic_keys
-                    if COMPONENT_TEST_ROI_LOGIC_PROFILES[key]["label"] == selected_roi_logic_label
-                )
-                st.caption(str(COMPONENT_TEST_ROI_LOGIC_PROFILES[selected_roi_logic_key]["description"]))
+                selected_roi_logic_key = DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY
+                st.caption("ROI-Extraktion: Hysterese mit gap=1, Coverage-Pass fuer Hot-Patches und finalem Touch-Merge.")
                 st.caption(
                     "Frische Inferenz laedt den Backbone, baut die Referenzbank und extrahiert danach "
                     "ROIs fuer jedes hochgeladene Bild."
