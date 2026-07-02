@@ -22,6 +22,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_f
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from streamlit_image_coordinates import streamlit_image_coordinates
 from torchvision import transforms
 
 
@@ -45,6 +46,17 @@ from extract_labeled_roi_toppercent_multilayer_softmax_patch_features import (
     load_multilayer_cache,
     load_roi_table as load_roi_classifier_roi_table,
     prepare_labeled_roi_table as prepare_roi_classifier_labeled_roi_table,
+)
+from analysis_tools.similarity_support.fit_roi_irelief_cosine import (
+    build_weighted_feature_set,
+    estimate_sigma,
+    fit_irelief_cosine,
+    l2_normalize_rows,
+    pairwise_cosine_distance,
+)
+from analysis_tools.similarity_support.sweep_roi_topkpatchcount_irelief_fixedk32_rbf import (
+    build_features_for_patch_count as build_top1patch_classifier_features,
+    build_sample_cache as build_top1patch_classifier_sample_cache,
 )
 from show_heatmap import (
     boxes_overlap,
@@ -1175,154 +1187,6 @@ def _compute_three_class_metrics(true_labels: list[str], pred_labels: list[str])
             for idx, label in enumerate(labels)
         },
     }
-
-
-def _compute_binary_roi_metrics(true_labels: list[str], pred_labels: list[str]) -> dict[str, Any]:
-    labels = ["2D", "3D"]
-    precision, recall, f1, support = precision_recall_fscore_support(
-        true_labels,
-        pred_labels,
-        labels=labels,
-        average=None,
-        zero_division=0,
-    )
-    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
-        true_labels,
-        pred_labels,
-        labels=labels,
-        average="macro",
-        zero_division=0,
-    )
-    conf = confusion_matrix(true_labels, pred_labels, labels=labels)
-    return {
-        "accuracy": float(accuracy_score(true_labels, pred_labels)),
-        "macro_precision": float(macro_precision),
-        "macro_recall": float(macro_recall),
-        "macro_f1": float(macro_f1),
-        "labels": labels,
-        "confusion_matrix": conf.astype(int).tolist(),
-        "per_class": {
-            label: {
-                "precision": float(precision[idx]),
-                "recall": float(recall[idx]),
-                "f1": float(f1[idx]),
-                "support": int(support[idx]),
-            }
-            for idx, label in enumerate(labels)
-        },
-    }
-
-
-def _normalize_roi_test_label(value: object) -> str:
-    text = str(value).strip().upper()
-    if text in {"2D", "2-D", "2 D"}:
-        return "2D"
-    if text in {"3D", "3-D", "3 D"}:
-        return "3D"
-    return ""
-
-
-def _build_roi_classifier_label_table(results: list[dict[str, Any]]) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for result in results:
-        image_name = str(result.get("sample", ""))
-        for roi_idx, roi_row in enumerate(result.get("roi_predictions", []), start=1):
-            roi_id = str(roi_row.get("roi_nummer", "")).strip() or f"roi{roi_idx}"
-            pred_label = _normalize_roi_test_label(roi_row.get("predicted_label", ""))
-            pred_conf = float(roi_row.get("predicted_probability", 0.0)) * 100.0
-            rows.append(
-                {
-                    "image_name": image_name,
-                    "roi_id": roi_id,
-                    "pred_roi_label": pred_label,
-                    "pred_confidence_percent": round(pred_conf, 2),
-                    "true_roi_label": "",
-                }
-            )
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "image_name",
-            "roi_id",
-            "pred_roi_label",
-            "pred_confidence_percent",
-            "true_roi_label",
-        ],
-    )
-
-
-def _dataframe_to_xlsx_bytes(table: pd.DataFrame, sheet_name: str = "roi_labels") -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        table.to_excel(writer, index=False, sheet_name=sheet_name)
-    return buffer.getvalue()
-
-
-def _read_uploaded_label_table(uploaded_file: Any) -> pd.DataFrame:
-    name = str(getattr(uploaded_file, "name", "")).lower()
-    data = uploaded_file.getvalue()
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(io.BytesIO(data))
-    return pd.read_csv(io.BytesIO(data), sep=None, engine="python")
-
-
-def _evaluate_roi_classifier_label_table(table: pd.DataFrame) -> dict[str, Any]:
-    required_columns = {"image_name", "roi_id", "pred_roi_label", "true_roi_label"}
-    missing = sorted(required_columns - set(table.columns))
-    if missing:
-        raise ValueError(f"Pflichtspalten fehlen: {', '.join(missing)}")
-
-    eval_table = table.copy()
-    eval_table["image_name"] = eval_table["image_name"].astype(str)
-    eval_table["roi_id"] = eval_table["roi_id"].astype(str)
-    eval_table["pred_roi_label"] = eval_table["pred_roi_label"].map(_normalize_roi_test_label)
-    eval_table["true_roi_label"] = eval_table["true_roi_label"].map(_normalize_roi_test_label)
-    eval_table = eval_table[
-        eval_table["pred_roi_label"].isin(["2D", "3D"])
-        & eval_table["true_roi_label"].isin(["2D", "3D"])
-    ].copy()
-    if eval_table.empty:
-        raise ValueError("Keine auswertbaren ROI-Zeilen gefunden. Fuell die Spalte true_roi_label mit 2D oder 3D.")
-
-    roi_metrics = _compute_binary_roi_metrics(
-        eval_table["true_roi_label"].tolist(),
-        eval_table["pred_roi_label"].tolist(),
-    )
-
-    part_rows: list[dict[str, Any]] = []
-    for image_name, image_df in eval_table.groupby("image_name", sort=True):
-        true_part_label = "3D" if (image_df["true_roi_label"] == "3D").any() else "2D"
-        pred_part_label = "3D" if (image_df["pred_roi_label"] == "3D").any() else "2D"
-        part_rows.append(
-            {
-                "image_name": str(image_name),
-                "true_part_label": true_part_label,
-                "pred_part_label": pred_part_label,
-                "num_rois": int(image_df.shape[0]),
-                "num_true_3d_rois": int((image_df["true_roi_label"] == "3D").sum()),
-                "num_pred_3d_rois": int((image_df["pred_roi_label"] == "3D").sum()),
-            }
-        )
-    part_table = pd.DataFrame(part_rows)
-    part_metrics = _compute_binary_roi_metrics(
-        part_table["true_part_label"].tolist(),
-        part_table["pred_part_label"].tolist(),
-    )
-    return {
-        "roi_table": eval_table,
-        "part_table": part_table,
-        "roi_metrics": roi_metrics,
-        "part_metrics": part_metrics,
-    }
-
-
-def _confusion_matrix_dataframe(metrics: dict[str, Any]) -> pd.DataFrame:
-    labels = list(metrics.get("labels", ["2D", "3D"]))
-    return pd.DataFrame(
-        np.asarray(metrics.get("confusion_matrix", np.zeros((len(labels), len(labels)), dtype=int))),
-        index=[f"true_{label}" for label in labels],
-        columns=[f"pred_{label}" for label in labels],
-    )
 
 
 def _aggregate_part_level_predictions(image_result_rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -4396,88 +4260,6 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
     st.subheader("Bauteil-Ergebnisse")
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-    st.subheader("ROI-Klassifikator-Testauswertung")
-    st.caption(
-        "Optionaler Workflow fuer einen separaten ROI-Testdatensatz. "
-        "Exportiere zuerst die ROI-Vorhersagen, trage in Excel `true_roi_label` ein "
-        "und lade die ausgefuellte Tabelle danach wieder hoch."
-    )
-    label_table = _build_roi_classifier_label_table(results)
-    if label_table.empty:
-        st.info("Fuer den aktuellen Lauf gibt es keine ROIs. Es kann keine ROI-Testtabelle exportiert werden.")
-    else:
-        export_col, upload_col = st.columns([0.9, 1.1])
-        with export_col:
-            st.metric("Exportierbare ROIs", str(len(label_table)))
-            st.download_button(
-                "ROI-Testtabelle als Excel herunterladen",
-                data=_dataframe_to_xlsx_bytes(label_table),
-                file_name=f"roi_classifier_test_labels_{_safe_name(stored_classifier_choice.lower())}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            st.download_button(
-                "ROI-Testtabelle als CSV herunterladen",
-                data=label_table.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"roi_classifier_test_labels_{_safe_name(stored_classifier_choice.lower())}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with upload_col:
-            uploaded_label_table = st.file_uploader(
-                "Gelabelte ROI-Testtabelle hochladen",
-                type=["xlsx", "xls", "csv"],
-                key="roi_classifier_eval_label_table_upload",
-            )
-            if st.button("Metriken berechnen", use_container_width=True, disabled=uploaded_label_table is None):
-                try:
-                    uploaded_table = _read_uploaded_label_table(uploaded_label_table)
-                    evaluation = _evaluate_roi_classifier_label_table(uploaded_table)
-                except Exception as exc:
-                    st.error(f"ROI-Testtabelle konnte nicht ausgewertet werden: {exc}")
-                else:
-                    roi_metrics = evaluation["roi_metrics"]
-                    part_metrics = evaluation["part_metrics"]
-                    st.success(
-                        f"Auswertung abgeschlossen: {len(evaluation['roi_table'])} ROIs, "
-                        f"{len(evaluation['part_table'])} Bauteile/Bilder."
-                    )
-
-                    st.markdown("**ROI-Ebene**")
-                    roi_cols = st.columns(5)
-                    roi_cols[0].metric("Accuracy", f"{roi_metrics['accuracy']:.3f}")
-                    roi_cols[1].metric("Macro-F1", f"{roi_metrics['macro_f1']:.3f}")
-                    roi_cols[2].metric("Macro-Recall", f"{roi_metrics['macro_recall']:.3f}")
-                    roi_cols[3].metric("3D-Recall", f"{roi_metrics['per_class']['3D']['recall']:.3f}")
-                    roi_cols[4].metric("3D-F1", f"{roi_metrics['per_class']['3D']['f1']:.3f}")
-                    st.dataframe(_confusion_matrix_dataframe(roi_metrics), use_container_width=True)
-
-                    st.markdown("**Bauteilebene**")
-                    part_cols = st.columns(5)
-                    part_cols[0].metric("Accuracy", f"{part_metrics['accuracy']:.3f}")
-                    part_cols[1].metric("Macro-F1", f"{part_metrics['macro_f1']:.3f}")
-                    part_cols[2].metric("Macro-Recall", f"{part_metrics['macro_recall']:.3f}")
-                    part_cols[3].metric("3D-Recall", f"{part_metrics['per_class']['3D']['recall']:.3f}")
-                    part_cols[4].metric("3D-F1", f"{part_metrics['per_class']['3D']['f1']:.3f}")
-                    st.dataframe(_confusion_matrix_dataframe(part_metrics), use_container_width=True)
-
-                    with st.expander("Aggregierte Bauteilentscheidungen", expanded=False):
-                        st.dataframe(evaluation["part_table"], use_container_width=True, hide_index=True)
-                    metrics_payload = {
-                        "classifier": stored_classifier_choice,
-                        "num_roi_rows": int(len(evaluation["roi_table"])),
-                        "num_parts": int(len(evaluation["part_table"])),
-                        "roi_metrics": roi_metrics,
-                        "part_metrics": part_metrics,
-                    }
-                    st.download_button(
-                        "Metriken als JSON herunterladen",
-                        data=json.dumps(metrics_payload, indent=2, ensure_ascii=False).encode("utf-8"),
-                        file_name=f"roi_classifier_metrics_{_safe_name(stored_classifier_choice.lower())}.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
-
     for result in results:
         label = f"{result['sample']} -> {result['part_label']}"
         with st.expander(label, expanded=len(results) == 1):
@@ -4502,8 +4284,12 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
 
 
 def main() -> None:
-    st.set_page_config(page_title="AnomalyDINO Explorer", layout="wide")
-    st.title("AnomalyDINO Explorer")
+    st.set_page_config(page_title="AnomalyDINO Similarity Explorer", layout="wide")
+    st.title("AnomalyDINO Similarity Explorer")
+    st.caption(
+        "Analysewerkzeug zur visuellen Untersuchung von Patch-Aehnlichkeiten. "
+        "Dieses Werkzeug ist vom finalen Bauteil-Test getrennt."
+    )
 
     default_experiment_dir = _parse_experiment_dir_from_argv()
     experiment_dir_str = st.sidebar.text_input("Experiment Directory", value=default_experiment_dir)
@@ -4522,28 +4308,14 @@ def main() -> None:
         }
         st.warning(
             "Der vollstaendige Run-Kontext konnte nicht geladen werden. "
-            "Cache-abhaengige Ansichten wie `Bauteil-Test` fuer vorhandene Run-Bilder "
-            "benoetigen die separat bereitgestellten Feature- und Anomaly-Map-Caches. "
+            "Der Similarity Explorer benoetigt die separat bereitgestellten Feature- und Anomaly-Map-Caches. "
             f"Details: {exc}"
         )
 
-    view_mode = st.radio(
-        "Ansicht",
-        options=["Bauteil-Test", "Einstellungen"],
-        index=1 if context_load_error is not None else 0,
-        horizontal=True,
-    )
-    if view_mode == "Bauteil-Test":
-        render_component_test_mode(context, experiment_dir_str, int(seed))
-        return
-    if view_mode == "Einstellungen":
-        render_settings_mode(context, experiment_dir_str, int(seed))
-        return
-
     if context_load_error is not None:
         st.info(
-            "Cache-abhaengige Ansichten sind erst nutzbar, wenn die externen Feature-Caches "
-            "und Anomaly-Maps in den Experimentordner gelegt wurden."
+            "`Similarity Explorer` ist in diesem reduzierten GitHub-Stand erst nutzbar, "
+            "wenn die externen Feature-Caches und Anomaly-Maps in den Experimentordner gelegt wurden."
         )
         return
 

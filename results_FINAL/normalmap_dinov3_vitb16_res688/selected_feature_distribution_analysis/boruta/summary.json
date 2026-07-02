@@ -1,0 +1,51 @@
+{
+  "name": "boruta",
+  "selected_features_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf\\selected_features.csv",
+  "selected_feature_count": 152,
+  "layer_dim": 768,
+  "aggregation_counts": {
+    "max": 33,
+    "mean": 90,
+    "min": 29
+  },
+  "aggregation_percent": {
+    "max": 21.71,
+    "mean": 59.21,
+    "min": 19.08
+  },
+  "layer_counts": {
+    "1": 4,
+    "2": 15,
+    "3": 26,
+    "4": 13,
+    "5": 15,
+    "6": 19,
+    "7": 14,
+    "8": 18,
+    "9": 7,
+    "10": 15,
+    "11": 3,
+    "12": 3
+  },
+  "layer_percent": {
+    "1": 2.63,
+    "2": 9.87,
+    "3": 17.11,
+    "4": 8.55,
+    "5": 9.87,
+    "6": 12.5,
+    "7": 9.21,
+    "8": 11.84,
+    "9": 4.61,
+    "10": 9.87,
+    "11": 1.97,
+    "12": 1.97
+  },
+  "outputs": {
+    "selected_features_decoded_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\selected_feature_distribution_analysis\\boruta\\selected_features_decoded.csv",
+    "aggregation_counts_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\selected_feature_distribution_analysis\\boruta\\aggregation_counts.csv",
+    "layer_counts_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\selected_feature_distribution_analysis\\boruta\\layer_counts.csv",
+    "layer_by_aggregation_counts_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\selected_feature_distribution_analysis\\boruta\\layer_by_aggregation_counts.csv",
+    "summary_json": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\selected_feature_distribution_analysis\\boruta\\summary.json"
+  }
+}

@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from component_memory_bank.data_io import load_run_samples
+from src.run_data_io import load_run_samples
 from extract_labeled_roi_toppercent_pca_softmax_patch_features import (
     DEFAULT_EXPERIMENT_DIR,
     DEFAULT_LABELS_FILE,

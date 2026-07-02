@@ -1,0 +1,21 @@
+{
+  "experiment_dir": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413",
+  "roi_metadata_csv": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\roi_crops_peak_hysteresis_h0.5_l0.2_merge3bridge0.1\\seed=0\\roi_metadata.csv",
+  "labels_file": "C:\\ai\\AnomalyDINO\\labeling_tables\\dinov3_res688_roi_labels.xlsx",
+  "output_dir": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf",
+  "overlay_dir": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf\\overlay_images",
+  "num_total_boxes": 540,
+  "num_labeled_boxes_used_for_training": 156,
+  "num_unlabeled_boxes_predicted_only": 384,
+  "fixed_k": 384,
+  "prefilter_top": 4096,
+  "selector": "mrmr_mi_relevance_abs_corr_redundancy",
+  "classifier": "rbf_svm",
+  "selection_mode": "overlap",
+  "candidate_rule": "overlap_and_score_gt_image_threshold",
+  "aggregation_mode": "max_plus_min_plus_mean",
+  "classifier_joblib": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf\\classifier_pipeline.joblib",
+  "selected_features_csv": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf\\selected_features.csv",
+  "all_box_predictions_csv": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf\\all_box_predictions.csv",
+  "manifest_csv": "C:\\ai\\AnomalyDINO\\results_CUSTOM\\dinov3_vitb16_688\\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413\\final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf\\manifest.csv"
+}

@@ -1,0 +1,17 @@
+{
+  "selector": "boruta_shadow_random_forest",
+  "prefilter_selector": "mrmr_mi_relevance_abs_corr_redundancy",
+  "prefilter_k": 1000,
+  "mrmr_prefilter_top": 4096,
+  "selected_feature_count_for_model": 152,
+  "svm_kernel": "rbf",
+  "svm_c": 1.0,
+  "svm_gamma": "scale",
+  "class_weight": "balanced",
+  "selection_mode": "overlap",
+  "candidate_rule": "overlap_and_score_gt_image_threshold",
+  "aggregation_mode": "max_plus_min_plus_mean",
+  "selected_features_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf\\selected_features.csv",
+  "selected_feature_indices_npy": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf\\selected_feature_indices.npy",
+  "classifier_joblib": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf\\classifier_pipeline.joblib"
+}

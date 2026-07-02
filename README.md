@@ -13,9 +13,9 @@ Wichtige Pfade:
 - `anomalydino_similarity_app/app.py`: Streamlit-App fuer Einstellungen, Bauteil-Test und Testdatensatz-Evaluierung.
 - `src/backbones.py`: Backbone-Laden inklusive DINOv3-Unterstuetzung.
 - `show_heatmap.py`: Funktionen der hysterese-basierten ROI-Extraktion.
-- `results_CUSTOM/.../final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf`: gespeicherter mRMR-RBF-SVM-Klassifikator.
-- `results_CUSTOM/.../final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf`: gespeicherter Boruta-RBF-SVM-Klassifikator.
-- `results_CUSTOM/.../app_settings/anomaly_detection/normalmap/confirmed_threshold_config.json`: bestaetigte Normalmap-Anomaly-Detection-Konfiguration.
+- `results_FINAL/normalmap_dinov3_vitb16_res688/final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf`: gespeicherter mRMR-RBF-SVM-Klassifikator.
+- `results_FINAL/normalmap_dinov3_vitb16_res688/final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf`: gespeicherter Boruta-RBF-SVM-Klassifikator.
+- `results_FINAL/normalmap_dinov3_vitb16_res688/app_settings/anomaly_detection/normalmap/confirmed_threshold_config.json`: bestaetigte Normalmap-Anomaly-Detection-Konfiguration.
 
 Weitere Details zur App stehen in `anomalydino_similarity_app/README.md`.
 

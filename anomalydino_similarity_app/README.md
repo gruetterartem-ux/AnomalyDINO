@@ -132,7 +132,7 @@ python -m streamlit run .\anomalydino_similarity_app\app.py
 Optional mit explizitem Experiment-Ordner:
 
 ```powershell
-python -m streamlit run .\anomalydino_similarity_app\app.py -- ".\results_CUSTOM\dinov3_vitb16_688\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413"
+python -m streamlit run .\anomalydino_similarity_app\app.py -- ".\results_FINAL\normalmap_dinov3_vitb16_res688"
 ```
 
 Dann im Browser:

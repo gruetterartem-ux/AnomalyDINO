@@ -10,12 +10,11 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from component_memory_bank.data_io import load_patch_features, load_patch_scores, load_run_samples
+from src.run_data_io import load_patch_features, load_patch_scores, load_run_samples
 
 
 DEFAULT_EXPERIMENT_DIR = Path(
-    r"C:\ai\AnomalyDINO\results_CUSTOM\dinov3_vitb16_688"
-    r"\8-shot_preprocess=force_no_mask_no_rotation_bestsearch8_fast20greedy_maxanomap_res688_evaltrain_20260413"
+    r"C:\ai\AnomalyDINO\results_FINAL\normalmap_dinov3_vitb16_res688"
 )
 DEFAULT_ROI_METADATA_CSV = (
     DEFAULT_EXPERIMENT_DIR
