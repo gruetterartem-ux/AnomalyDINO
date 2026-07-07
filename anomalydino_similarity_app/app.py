@@ -5,6 +5,7 @@ import io
 import json
 import shutil
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1258,6 +1259,50 @@ def _dataframe_to_xlsx_bytes(table: pd.DataFrame, sheet_name: str = "roi_labels"
     return buffer.getvalue()
 
 
+def _component_test_overlays_to_zip_bytes(results: list[dict[str, Any]]) -> bytes:
+    buffer = io.BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        manifest_rows: list[dict[str, Any]] = []
+        for index, result in enumerate(results, start=1):
+            overlay_rgb = result.get("overlay_rgb")
+            if overlay_rgb is None:
+                continue
+            overlay_array = np.asarray(overlay_rgb, dtype=np.uint8)
+            sample_name = str(result.get("sample", f"image_{index:04d}"))
+            stem = _safe_name(Path(sample_name).stem) or f"image_{index:04d}"
+            file_name = f"{stem}.png"
+            if file_name in used_names:
+                file_name = f"{index:04d}_{file_name}"
+            used_names.add(file_name)
+
+            image_buffer = io.BytesIO()
+            Image.fromarray(overlay_array).save(image_buffer, format="PNG")
+            archive.writestr(file_name, image_buffer.getvalue())
+            manifest_rows.append(
+                {
+                    "order": index,
+                    "sample": sample_name,
+                    "overlay_file": file_name,
+                    "part_label": str(result.get("part_label", "")),
+                    "num_rois": int(result.get("num_rois", 0)),
+                    "num_3d_rois": int(result.get("num_3d_rois", 0)),
+                }
+            )
+
+        if manifest_rows:
+            manifest_buffer = io.StringIO()
+            writer = csv.DictWriter(
+                manifest_buffer,
+                fieldnames=["order", "sample", "overlay_file", "part_label", "num_rois", "num_3d_rois"],
+            )
+            writer.writeheader()
+            writer.writerows(manifest_rows)
+            archive.writestr("overlay_manifest.csv", manifest_buffer.getvalue())
+
+    return buffer.getvalue()
+
+
 def _read_uploaded_label_table(uploaded_file: Any) -> pd.DataFrame:
     name = str(getattr(uploaded_file, "name", "")).lower()
     data = uploaded_file.getvalue()
@@ -2364,14 +2409,15 @@ def _render_component_test_overlay(
     roi_boxes: list[tuple[dict[str, Any], tuple[int, int, int, int]]] = []
 
     for row_dict in roi_prediction_rows:
-        x0, y0, x1, y1 = _roi_patch_box_to_display_box(
-            image_rgb=overlay,
-            grid_shape=grid_shape,
-            row_min=int(row_dict["region_row_min"]),
-            row_max=int(row_dict["region_row_max"]),
-            col_min=int(row_dict["region_col_min"]),
-            col_max=int(row_dict["region_col_max"]),
-        )
+        # The ROI extraction already maps patch boxes back to image coordinates while
+        # accounting for DINO resize/crop-to-patch-multiple behavior. Reusing these
+        # coordinates avoids a horizontal/vertical overlay drift from re-scaling the
+        # patch grid over the uncropped image extent.
+        image_h, image_w = overlay.shape[:2]
+        x0 = max(0, min(int(row_dict["x_min"]), image_w - 1))
+        y0 = max(0, min(int(row_dict["y_min"]), image_h - 1))
+        x1 = max(x0 + 1, min(int(row_dict["x_max"]), image_w))
+        y1 = max(y0 + 1, min(int(row_dict["y_max"]), image_h))
         roi_boxes.append((row_dict, (x0, y0, x1, y1)))
 
     blocked_rects = [box for _, box in roi_boxes]
@@ -4395,6 +4441,17 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
 
     st.subheader("Bauteil-Ergebnisse")
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    overlay_count = sum(1 for row in results if row.get("overlay_rgb") is not None)
+    if overlay_count:
+        st.download_button(
+            f"Alle ROI-Overlays als ZIP speichern ({overlay_count})",
+            data=_component_test_overlays_to_zip_bytes(results),
+            file_name=f"component_test_overlays_{_safe_name(stored_classifier_choice.lower())}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    elif render_overlays:
+        st.info("Es wurden keine Overlaybilder erzeugt, die gespeichert werden koennten.")
 
     st.subheader("ROI-Klassifikator-Testauswertung")
     st.caption(
