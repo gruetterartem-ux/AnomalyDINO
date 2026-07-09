@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--features-dir", type=Path, default=DEFAULT_FEATURES_DIR)
     parser.add_argument("--selected-features-csv", type=Path, default=DEFAULT_SELECTED_CSV)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--classifier", type=str, default="svm_rbf", choices=("logreg", "svm_linear", "svm_rbf", "rf"))
+    parser.add_argument(
+        "--classifier",
+        type=str,
+        default="svm_rbf",
+        choices=("logreg", "svm_linear", "svm_rbf", "rf", "extratrees"),
+    )
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--random-state", type=int, default=0)
     parser.add_argument("--max-iter", type=int, default=4000)

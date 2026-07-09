@@ -8,7 +8,7 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.metrics import precision_recall_fscore_support
@@ -105,6 +105,17 @@ def build_estimator(args: argparse.Namespace, classifier: str):
     if classifier == "rf":
         rf_class_weight = None if args.rf_class_weight == "none" else args.rf_class_weight
         return RandomForestClassifier(
+            n_estimators=args.rf_n_estimators,
+            max_depth=args.rf_max_depth,
+            min_samples_leaf=args.rf_min_samples_leaf,
+            max_features=args.rf_max_features,
+            class_weight=rf_class_weight,
+            random_state=args.random_state,
+            n_jobs=1,
+        )
+    if classifier == "extratrees":
+        rf_class_weight = None if args.rf_class_weight == "none" else args.rf_class_weight
+        return ExtraTreesClassifier(
             n_estimators=args.rf_n_estimators,
             max_depth=args.rf_max_depth,
             min_samples_leaf=args.rf_min_samples_leaf,

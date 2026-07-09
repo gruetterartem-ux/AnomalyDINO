@@ -78,6 +78,9 @@ TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR = "final_all_boxes_top1patch_multilayer_irel
 BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
     "final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf"
 )
+BORUTA_EXTRATREES_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
+    "final_all_boxes_overthreshold_maxminmean_boruta_confirmed_extratrees_candidate"
+)
 MRMR_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
     "final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf"
 )
@@ -129,6 +132,7 @@ COMPONENT_TEST_ROI_SETTINGS = {
 DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY = "buttons_new"
 COMPONENT_CLASSIFIER_LABELS = {
     "Boruta": "SVM-RBF mit Boruta Merkmalen",
+    "BorutaExtraTrees": "ExtraTrees mit Boruta Merkmalen",
     "mRMR": "SVM-RBF mit mRMR Merkmalen",
 }
 
@@ -1106,13 +1110,17 @@ def _sync_state_value(target_key: str, source_key: str) -> None:
 
 def _classifier_signature_for_subdir(experiment_dir_str: str, classifier_subdir: str) -> tuple[tuple[str, int, int], ...]:
     classifier_dir = Path(experiment_dir_str).resolve() / classifier_subdir
-    return _classifier_file_signature(
+    signature_paths = [
         classifier_dir / "selected_features.csv",
         classifier_dir / "selected_feature_indices.npy",
         classifier_dir / "classifier_pipeline.joblib",
         classifier_dir / "model_info.json",
         classifier_dir / "summary.json",
-    )
+    ]
+    existing_paths = [path for path in signature_paths if path.exists()]
+    if not existing_paths:
+        return tuple()
+    return _classifier_file_signature(*existing_paths)
 
 
 def _load_selected_component_classifier(experiment_dir_str: str, classifier_choice: str) -> dict[str, Any]:
@@ -1120,6 +1128,16 @@ def _load_selected_component_classifier(experiment_dir_str: str, classifier_choi
         return load_boruta_component_classifier_model(
             experiment_dir_str,
             _classifier_signature_for_subdir(experiment_dir_str, BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR),
+        )
+    if classifier_choice == "BorutaExtraTrees":
+        return load_component_roi_classifier_model(
+            experiment_dir_str=experiment_dir_str,
+            classifier_subdir=BORUTA_EXTRATREES_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+            classifier_label="Boruta + ExtraTrees",
+            cache_signature=_classifier_signature_for_subdir(
+                experiment_dir_str,
+                BORUTA_EXTRATREES_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+            ),
         )
     if classifier_choice == "mRMR":
         return load_mrmr_component_classifier_model(
@@ -3971,7 +3989,7 @@ def render_test_dataset_mode(experiment_dir_str: str, seed: int) -> None:
 
         classifier_choice = st.selectbox(
             "ROI-Klassifikator",
-            options=["Boruta", "mRMR"],
+            options=["Boruta", "BorutaExtraTrees", "mRMR"],
             index=0,
             key="test_dataset_classifier_choice",
             format_func=_format_component_classifier_choice,
@@ -4277,12 +4295,12 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
         with option_col:
             classifier_choice = st.selectbox(
                 "ROI-Klassifikator",
-                options=["Boruta", "mRMR"],
+                options=["Boruta", "BorutaExtraTrees", "mRMR"],
                 index=0,
                 key="component_test_classifier_choice",
                 format_func=_format_component_classifier_choice,
             )
-            st.caption("Beide Optionen nutzen RBF-SVMs mit derselben min/max/mean-ROI-Featurelogik.")
+            st.caption("Alle Optionen nutzen dieselbe min/max/mean-ROI-Featurelogik; nur Featureauswahl und Klassifikator unterscheiden sich.")
             render_overlays = st.checkbox("Overlays rendern", value=False, key="component_test_render_overlays")
             if source_mode == "Run-Bilder":
                 st.caption("Wenn aktiv, werden pro Bild ROI-Boxen mit 2D/3D-Labels direkt in der App gerendert.")
