@@ -1,0 +1,14 @@
+{
+  "classifier": "extra_trees",
+  "source_feature_set": "Boruta features + ExtraTrees",
+  "selected_feature_count": 152,
+  "rf_n_estimators": 500,
+  "rf_min_samples_leaf": 2,
+  "rf_max_features": "sqrt",
+  "rf_class_weight": "balanced_subsample",
+  "features_dir": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\roi_overthreshold_overlap_multilayer_l1to12_maxminmean_features_labeled",
+  "selection_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf\\selected_features.csv",
+  "classifier_joblib": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_confirmed_extratrees_candidate\\classifier_pipeline.joblib",
+  "selected_feature_indices_npy": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_confirmed_extratrees_candidate\\selected_feature_indices.npy",
+  "selected_features_csv": "C:\\ai\\AnomalyDINO\\results_FINAL\\normalmap_dinov3_vitb16_res688\\final_all_boxes_overthreshold_maxminmean_boruta_confirmed_extratrees_candidate\\selected_features.csv"
+}
