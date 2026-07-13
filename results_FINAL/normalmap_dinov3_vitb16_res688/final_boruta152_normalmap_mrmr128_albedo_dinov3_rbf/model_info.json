@@ -1,0 +1,33 @@
+{
+  "model_name": "Boruta-152 normalmap + mRMR-128 DINOv3 albedo + RBF-SVM",
+  "classifier": "SVC",
+  "kernel": "rbf",
+  "C": 1.0,
+  "gamma": "scale",
+  "class_weight": "balanced",
+  "scaler": "StandardScaler",
+  "training_rois": 156,
+  "normalmap_features": {
+    "count": 152,
+    "selector": "Boruta",
+    "dinov3_layers": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    "aggregation": ["max", "min", "mean"]
+  },
+  "albedo_features": {
+    "count": 128,
+    "selector": "mRMR",
+    "dinov3_layers": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    "aggregation": ["max", "min", "mean"],
+    "patch_positions": "same anomalous patch positions selected from the normalmap"
+  },
+  "combined_feature_count": 280,
+  "decision_rule": "probability_3d_threshold",
+  "probability_threshold_3d": 0.6104560494422913,
+  "threshold_selection": "PR analysis on pooled fold-safe OOF development probabilities with non-decreasing 3D recall",
+  "crossvalidation_results": "../roi_overthreshold_overlap_multilayer_l1to12_maxminmean_features_labeled/experiment_albedo_dinov3_l1_2_3_4_5_6_7_8_9_10_11_12_maxminmean/summary.json",
+  "test_metrics": "test_metrics.json",
+  "classifier_artifact": "classifier_pipeline.joblib",
+  "normalmap_indices": "selected_normal_feature_indices.npy",
+  "albedo_indices": "selected_albedo_feature_indices.npy",
+  "albedo_feature_description": "selected_albedo_features.csv"
+}

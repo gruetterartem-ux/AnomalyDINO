@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from anomalydino_similarity_app import app as app_mod  # noqa: E402
+from anomalydino_app import app as app_mod  # noqa: E402
 
 
 DEFAULT_TEST_DIR = Path(r"D:\Thesis\Thesis Bericht\bericht Medien\Test")

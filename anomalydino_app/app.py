@@ -5,6 +5,7 @@ import io
 import json
 import shutil
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,10 +20,6 @@ from PIL import Image
 from joblib import load as joblib_load
 from scipy.ndimage import label as nd_label
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
-from streamlit_image_coordinates import streamlit_image_coordinates
 from torchvision import transforms
 
 
@@ -39,30 +36,14 @@ from extract_labeled_roi_overthreshold_multilayer_maxstd_features import (
 )
 from extract_labeled_roi_toppercent_multilayer_softmax_patch_features import (
     DEFAULT_EXPERIMENT_DIR as ROI_CLASSIFIER_DEFAULT_EXPERIMENT_DIR,
-    DEFAULT_LABELS_FILE as ROI_CLASSIFIER_DEFAULT_LABELS_FILE,
     DEFAULT_ROI_METADATA_CSV as ROI_CLASSIFIER_DEFAULT_ROI_METADATA_CSV,
-    build_multilayer_run_context as build_roi_classifier_run_context,
-    load_labels_table as load_roi_classifier_labels_table,
     load_multilayer_cache,
     load_roi_table as load_roi_classifier_roi_table,
-    prepare_labeled_roi_table as prepare_roi_classifier_labeled_roi_table,
-)
-from analysis_tools.similarity_support.fit_roi_irelief_cosine import (
-    build_weighted_feature_set,
-    estimate_sigma,
-    fit_irelief_cosine,
-    l2_normalize_rows,
-    pairwise_cosine_distance,
-)
-from analysis_tools.similarity_support.sweep_roi_topkpatchcount_irelief_fixedk32_rbf import (
-    build_features_for_patch_count as build_top1patch_classifier_features,
-    build_sample_cache as build_top1patch_classifier_sample_cache,
 )
 from show_heatmap import (
     boxes_overlap,
     estimate_local_background,
     hysteresis_component,
-    infer_patch_multiple,
     merge_without_valley,
     patch_box_to_image_box,
     peak_candidates,
@@ -81,24 +62,18 @@ DEFAULT_EXPERIMENT_DIR = (
     / "results_FINAL"
     / "normalmap_dinov3_vitb16_res688"
 )
-EXPORT_SUBDIR = "similarity_query_exports"
-ALBEDO_CACHE_SUBDIR = "albedo_patch_feature_cache"
 MULTILAYER_CACHE_SUBDIR = "patch_feature_cache_multilayer_l1to12"
-TOP10PCT_CLASSIFIER_FEATURE_SUBDIR = "final_all_boxes_top10pct_multilayer_irelief_fixedk32_rbf"
-TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR = "final_all_boxes_top1patch_multilayer_irelief_fixedk32_rbf"
 BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
     "final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf"
+)
+BORUTA_EXTRATREES_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
+    "final_all_boxes_overthreshold_maxminmean_boruta_confirmed_extratrees_candidate"
 )
 MRMR_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
     "final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf"
 )
-IRELIEF_SUBDIR = (
-    "roi_top10pct_centerinbox_pca2_softmax_patch_features_labeled"
-    r"\irelief_cosine_weighted_features"
-)
-IRELIEF_MULTILAYER_SUBDIR = (
-    "roi_top10pct_centerinbox_multilayer_l1to12_softmax_patch_features_labeled"
-    r"\irelief_cosine_weighted_features"
+BORUTA_ALBEDO_FUSION_COMPONENT_CLASSIFIER_FEATURE_SUBDIR = (
+    "final_boruta152_normalmap_mrmr128_albedo_dinov3_rbf"
 )
 ROI_CLASSIFIER_ROI_METADATA_RELATIVE = ROI_CLASSIFIER_DEFAULT_ROI_METADATA_CSV.relative_to(
     ROI_CLASSIFIER_DEFAULT_EXPERIMENT_DIR
@@ -140,7 +115,9 @@ COMPONENT_TEST_ROI_SETTINGS = {
 DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY = "buttons_new"
 COMPONENT_CLASSIFIER_LABELS = {
     "Boruta": "SVM-RBF mit Boruta Merkmalen",
+    "BorutaExtraTrees": "ExtraTrees mit Boruta Merkmalen",
     "mRMR": "SVM-RBF mit mRMR Merkmalen",
+    "BorutaAlbedoFusion": "SVM-RBF mit Normalmap- und Albedo-Merkmalen",
 }
 
 
@@ -335,43 +312,6 @@ def load_run_context(experiment_dir_str: str, seed: int) -> dict[str, Any]:
     }
 
 
-@st.cache_data(show_spinner=False)
-def load_albedo_cache_manifest(experiment_dir_str: str, seed: int) -> dict[str, Any]:
-    experiment_dir = Path(experiment_dir_str).resolve()
-    manifest_path = experiment_dir / ALBEDO_CACHE_SUBDIR / f"seed={seed}" / "cache_manifest.csv"
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"Albedo-Cache-Manifest nicht gefunden: {manifest_path}. "
-            "Erzeuge zuerst den Albedo-Patch-Cache."
-        )
-
-    rows: list[dict[str, Any]] = []
-    sample_index: dict[str, dict[str, Any]] = {}
-    with manifest_path.open("r", newline="", encoding="utf-8") as handle:
-        for raw_row in csv.DictReader(handle):
-            sample = _clean_sample_name(raw_row["sample"])
-            row = {
-                "sample": sample,
-                "image_path": raw_row["image_path"],
-                "cache_file": raw_row["cache_file"],
-                "grid_h": int(raw_row["grid_h"]),
-                "grid_w": int(raw_row["grid_w"]),
-                "feature_dim": int(raw_row["feature_dim"]),
-                "patch_size": int(raw_row["patch_size"]),
-                "resized_width": int(raw_row["resized_width"]),
-                "resized_height": int(raw_row["resized_height"]),
-                "original_width": int(raw_row["original_width"]),
-                "original_height": int(raw_row["original_height"]),
-            }
-            rows.append(row)
-            sample_index[sample] = row
-
-    rows.sort(key=lambda item: item["sample"])
-    return {
-        "manifest_path": str(manifest_path),
-        "samples": rows,
-        "sample_index": sample_index,
-    }
 
 
 @st.cache_data(show_spinner=False)
@@ -416,245 +356,24 @@ def load_multilayer_cache_manifest(experiment_dir_str: str, seed: int) -> dict[s
     }
 
 
-@st.cache_data(show_spinner=False)
-def load_albedo_sample_assets(experiment_dir_str: str, seed: int, sample_name: str) -> dict[str, Any]:
-    manifest = load_albedo_cache_manifest(experiment_dir_str, seed)
-    if sample_name not in manifest["sample_index"]:
-        raise KeyError(f"Sample nicht im Albedo-Cache gefunden: {sample_name}")
-
-    sample_info = manifest["sample_index"][sample_name]
-    cache_file = Path(sample_info["cache_file"])
-    if not cache_file.exists():
-        raise FileNotFoundError(f"Albedo-Cache-Datei nicht gefunden: {cache_file}")
-
-    with np.load(cache_file) as data:
-        features = np.asarray(data["features"], dtype=np.float32)
-        grid_shape = tuple(int(v) for v in np.asarray(data["grid_size"]).tolist())
-        patch_size = int(np.asarray(data["patch_size"]).reshape(-1)[0])
-
-    norms = np.linalg.norm(features, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)
-    features_norm = (features / norms).astype(np.float32)
-
-    return {
-        "sample": sample_name,
-        "features_norm": features_norm,
-        "grid_shape": grid_shape,
-        "patch_size": patch_size,
-        "image_path": sample_info["image_path"],
-    }
 
 
-def _normalize_multilayer_patch_features(features_layers: np.ndarray) -> np.ndarray:
-    norms_layer = np.linalg.norm(features_layers, axis=2, keepdims=True)
-    norms_layer = np.maximum(norms_layer, 1e-8)
-    per_layer_norm = (features_layers / norms_layer).astype(np.float32)
-    concatenated = per_layer_norm.reshape(per_layer_norm.shape[0], -1).astype(np.float32)
-    norms_concat = np.linalg.norm(concatenated, axis=1, keepdims=True)
-    norms_concat = np.maximum(norms_concat, 1e-8)
-    return (concatenated / norms_concat).astype(np.float32)
 
 
-@st.cache_data(show_spinner=False)
-def load_multilayer_sample_assets(experiment_dir_str: str, seed: int, sample_name: str) -> dict[str, Any]:
-    manifest = load_multilayer_cache_manifest(experiment_dir_str, seed)
-    if sample_name not in manifest["sample_index"]:
-        raise KeyError(f"Sample nicht im Multi-Layer-Cache gefunden: {sample_name}")
-
-    sample_info = manifest["sample_index"][sample_name]
-    cache_file = Path(sample_info["cache_file"])
-    if not cache_file.exists():
-        raise FileNotFoundError(f"Multi-Layer-Cache-Datei nicht gefunden: {cache_file}")
-
-    with np.load(cache_file) as data:
-        features_layers = np.asarray(data["features_layers"], dtype=np.float32)
-        grid_shape = tuple(int(v) for v in np.asarray(data["grid_size"]).tolist())
-        patch_size = int(np.asarray(data["patch_size"]).reshape(-1)[0])
-        layer_indices = tuple(int(v) for v in np.asarray(data["layer_indices"]).tolist())
-
-    features_norm = _normalize_multilayer_patch_features(features_layers)
-
-    return {
-        "sample": sample_name,
-        "features_norm": features_norm,
-        "grid_shape": grid_shape,
-        "patch_size": patch_size,
-        "image_path": sample_info["image_path"],
-        "layer_indices": layer_indices if layer_indices else tuple(sample_info["layer_indices"]),
-        "num_layers": int(sample_info["num_layers"]),
-        "feature_dim": int(sample_info["feature_dim_concat"]),
-        "layer_dim": int(sample_info["layer_dim"]),
-    }
 
 
-def _load_normalized_features_for_reference(
-    experiment_dir_str: str,
-    seed: int,
-    row: dict[str, Any],
-    feature_source: str,
-) -> tuple[np.ndarray, tuple[int, int]]:
-    class _SampleProxy:
-        def __init__(self, image_path: str, feature_cache_path: str, anomaly_map_path: str) -> None:
-            self.image_path = Path(image_path)
-            self.feature_cache_path = Path(feature_cache_path)
-            self.anomaly_map_path = Path(anomaly_map_path)
-
-    if feature_source == "normal":
-        proxy = _SampleProxy(
-            image_path=row["image_path"],
-            feature_cache_path=row["feature_cache_path"],
-            anomaly_map_path=row["anomaly_map_path"],
-        )
-        features, grid_shape = load_patch_features(proxy)
-        norms = np.linalg.norm(features, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-8)
-        return (features / norms).astype(np.float32), tuple(int(v) for v in grid_shape)
-
-    if feature_source == "albedo":
-        assets = load_albedo_sample_assets(experiment_dir_str, seed, row["sample"])
-        return assets["features_norm"], tuple(int(v) for v in assets["grid_shape"])
-
-    raise ValueError(f"Unsupported feature_source: {feature_source}")
 
 
-def _build_positional_reference_impl(
-    experiment_dir_str: str,
-    seed: int,
-    feature_source: str,
-) -> dict[str, Any]:
-    context = load_run_context(experiment_dir_str, seed)
-    good_rows = [row for row in context["samples"] if int(row["image_label"]) == 0]
-    if not good_rows:
-        raise ValueError("Keine good-Bilder fuer die Positionsreferenz gefunden.")
-
-    sum_valid: np.ndarray | None = None
-    count_valid: np.ndarray | None = None
-    sum_all: np.ndarray | None = None
-    count_all: np.ndarray | None = None
-    grid_shape_ref: tuple[int, int] | None = None
-
-    class _SampleProxy:
-        def __init__(self, image_path: str, feature_cache_path: str, anomaly_map_path: str) -> None:
-            self.image_path = Path(image_path)
-            self.feature_cache_path = Path(feature_cache_path)
-            self.anomaly_map_path = Path(anomaly_map_path)
-
-    for row in good_rows:
-        proxy = _SampleProxy(
-            image_path=row["image_path"],
-            feature_cache_path=row["feature_cache_path"],
-            anomaly_map_path=row["anomaly_map_path"],
-        )
-        features_norm, grid_shape = _load_normalized_features_for_reference(
-            experiment_dir_str,
-            seed,
-            row,
-            feature_source=feature_source,
-        )
-        score_grid = load_patch_scores(proxy)
-        if grid_shape_ref is None:
-            grid_shape_ref = tuple(int(v) for v in grid_shape)
-            feature_dim = int(features_norm.shape[1])
-            num_patches = int(features_norm.shape[0])
-            sum_valid = np.zeros((num_patches, feature_dim), dtype=np.float64)
-            count_valid = np.zeros((num_patches,), dtype=np.int32)
-            sum_all = np.zeros((num_patches, feature_dim), dtype=np.float64)
-            count_all = np.zeros((num_patches,), dtype=np.int32)
-        elif tuple(int(v) for v in grid_shape) != grid_shape_ref:
-            raise ValueError(f"Inkonsistentes Grid in Referenzbildern: {grid_shape} vs {grid_shape_ref}")
-
-        features_norm = features_norm.astype(np.float64)
-        flat_scores = score_grid.reshape(-1)
-        valid_mask = flat_scores <= float(row["image_threshold"])
-
-        assert sum_valid is not None and count_valid is not None and sum_all is not None and count_all is not None
-        sum_all += features_norm
-        count_all += 1
-        if np.any(valid_mask):
-            sum_valid[valid_mask] += features_norm[valid_mask]
-            count_valid[valid_mask] += 1
-
-    assert sum_valid is not None and count_valid is not None and sum_all is not None and count_all is not None
-    mean_vectors = np.divide(
-        sum_valid,
-        np.maximum(count_valid[:, None], 1),
-        out=np.zeros_like(sum_valid),
-        where=count_valid[:, None] > 0,
-    )
-    fallback_vectors = np.divide(
-        sum_all,
-        np.maximum(count_all[:, None], 1),
-        out=np.zeros_like(sum_all),
-        where=count_all[:, None] > 0,
-    )
-    missing_mask = count_valid <= 0
-    if np.any(missing_mask):
-        mean_vectors[missing_mask] = fallback_vectors[missing_mask]
-
-    vector_norms = np.linalg.norm(mean_vectors, axis=1, keepdims=True)
-    vector_norms = np.maximum(vector_norms, 1e-8)
-    mean_vectors_norm = (mean_vectors / vector_norms).astype(np.float32)
-
-    return {
-        "reference_vectors": mean_vectors_norm,
-        "grid_shape": list(grid_shape_ref) if grid_shape_ref is not None else None,
-        "num_good_images": len(good_rows),
-        "num_positions_with_valid_mask": int(np.sum(count_valid > 0)),
-        "count_valid_min": int(count_valid.min()),
-        "count_valid_max": int(count_valid.max()),
-        "count_valid_mean": float(count_valid.mean()),
-    }
 
 
-@st.cache_data(show_spinner="Baue positionsbereinigte Referenz aus guten Bildern...")
-def load_positional_reference(experiment_dir_str: str, seed: int) -> dict[str, Any]:
-    return _build_positional_reference_impl(experiment_dir_str, seed, feature_source="normal")
 
 
-@st.cache_data(show_spinner="Baue Albedo-Positionsreferenz aus guten Bildern...")
-def load_albedo_positional_reference(experiment_dir_str: str, seed: int) -> dict[str, Any]:
-    return _build_positional_reference_impl(experiment_dir_str, seed, feature_source="albedo")
 
 
-@st.cache_data(show_spinner="Lade I-Relief-Gewichtung...")
-def load_irelief_scale_weights(experiment_dir_str: str) -> dict[str, Any]:
-    return _load_irelief_scale_weights_from_subdir(experiment_dir_str, IRELIEF_SUBDIR)
 
 
-@st.cache_data(show_spinner="Lade Multi-Layer-I-Relief-Gewichtung...")
-def load_multilayer_irelief_scale_weights(experiment_dir_str: str) -> dict[str, Any]:
-    return _load_irelief_scale_weights_from_subdir(experiment_dir_str, IRELIEF_MULTILAYER_SUBDIR)
 
 
-@st.cache_data(show_spinner="Lade Top10%-Klassifikator-Featureauswahl...")
-def load_top10pct_classifier_feature_selection(experiment_dir_str: str) -> dict[str, Any]:
-    experiment_dir = Path(experiment_dir_str).resolve()
-    selection_path = experiment_dir / TOP10PCT_CLASSIFIER_FEATURE_SUBDIR / "selected_topk_features.csv"
-    model_info_path = experiment_dir / TOP10PCT_CLASSIFIER_FEATURE_SUBDIR / "model_info.json"
-    summary_path = experiment_dir / TOP10PCT_CLASSIFIER_FEATURE_SUBDIR / "summary.json"
-    if not selection_path.exists():
-        raise FileNotFoundError(f"Top10%-Klassifikator-Featuredatei nicht gefunden: {selection_path}")
-
-    selection_df = pd.read_csv(selection_path)
-    if "feature_index" not in selection_df.columns:
-        raise ValueError(f"'feature_index' fehlt in {selection_path}")
-    feature_indices = selection_df["feature_index"].astype(np.int32).to_numpy()
-    if feature_indices.ndim != 1 or feature_indices.size <= 0:
-        raise ValueError(f"Ungueltige Featureauswahl in {selection_path}")
-
-    result: dict[str, Any] = {
-        "selection_path": str(selection_path),
-        "feature_indices": feature_indices,
-        "num_selected_features": int(feature_indices.size),
-        "subdir": TOP10PCT_CLASSIFIER_FEATURE_SUBDIR,
-    }
-    if model_info_path.exists():
-        result["model_info_path"] = str(model_info_path)
-        result["model_info"] = json.loads(model_info_path.read_text(encoding="utf-8"))
-    if summary_path.exists():
-        result["summary_path"] = str(summary_path)
-        result["summary"] = json.loads(summary_path.read_text(encoding="utf-8"))
-    return result
 
 
 def _classifier_file_signature(*paths: Path) -> tuple[tuple[str, int, int], ...]:
@@ -1117,13 +836,19 @@ def _sync_state_value(target_key: str, source_key: str) -> None:
 
 def _classifier_signature_for_subdir(experiment_dir_str: str, classifier_subdir: str) -> tuple[tuple[str, int, int], ...]:
     classifier_dir = Path(experiment_dir_str).resolve() / classifier_subdir
-    return _classifier_file_signature(
+    signature_paths = [
         classifier_dir / "selected_features.csv",
         classifier_dir / "selected_feature_indices.npy",
+        classifier_dir / "selected_normal_feature_indices.npy",
+        classifier_dir / "selected_albedo_feature_indices.npy",
         classifier_dir / "classifier_pipeline.joblib",
         classifier_dir / "model_info.json",
         classifier_dir / "summary.json",
-    )
+    ]
+    existing_paths = [path for path in signature_paths if path.exists()]
+    if not existing_paths:
+        return tuple()
+    return _classifier_file_signature(*existing_paths)
 
 
 def _load_selected_component_classifier(experiment_dir_str: str, classifier_choice: str) -> dict[str, Any]:
@@ -1132,10 +857,28 @@ def _load_selected_component_classifier(experiment_dir_str: str, classifier_choi
             experiment_dir_str,
             _classifier_signature_for_subdir(experiment_dir_str, BORUTA_COMPONENT_CLASSIFIER_FEATURE_SUBDIR),
         )
+    if classifier_choice == "BorutaExtraTrees":
+        return load_component_roi_classifier_model(
+            experiment_dir_str=experiment_dir_str,
+            classifier_subdir=BORUTA_EXTRATREES_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+            classifier_label="Boruta + ExtraTrees",
+            cache_signature=_classifier_signature_for_subdir(
+                experiment_dir_str,
+                BORUTA_EXTRATREES_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+            ),
+        )
     if classifier_choice == "mRMR":
         return load_mrmr_component_classifier_model(
             experiment_dir_str,
             _classifier_signature_for_subdir(experiment_dir_str, MRMR_COMPONENT_CLASSIFIER_FEATURE_SUBDIR),
+        )
+    if classifier_choice == "BorutaAlbedoFusion":
+        return load_boruta_albedo_fusion_component_classifier_model(
+            experiment_dir_str,
+            _classifier_signature_for_subdir(
+                experiment_dir_str,
+                BORUTA_ALBEDO_FUSION_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+            ),
         )
     raise ValueError(f"Unbekannter Klassifikator: {classifier_choice}")
 
@@ -1187,6 +930,198 @@ def _compute_three_class_metrics(true_labels: list[str], pred_labels: list[str])
             for idx, label in enumerate(labels)
         },
     }
+
+
+def _compute_binary_roi_metrics(true_labels: list[str], pred_labels: list[str]) -> dict[str, Any]:
+    labels = ["2D", "3D"]
+    precision, recall, f1, support = precision_recall_fscore_support(
+        true_labels,
+        pred_labels,
+        labels=labels,
+        average=None,
+        zero_division=0,
+    )
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        true_labels,
+        pred_labels,
+        labels=labels,
+        average="macro",
+        zero_division=0,
+    )
+    conf = confusion_matrix(true_labels, pred_labels, labels=labels)
+    return {
+        "accuracy": float(accuracy_score(true_labels, pred_labels)),
+        "macro_precision": float(macro_precision),
+        "macro_recall": float(macro_recall),
+        "macro_f1": float(macro_f1),
+        "labels": labels,
+        "confusion_matrix": conf.astype(int).tolist(),
+        "per_class": {
+            label: {
+                "precision": float(precision[idx]),
+                "recall": float(recall[idx]),
+                "f1": float(f1[idx]),
+                "support": int(support[idx]),
+            }
+            for idx, label in enumerate(labels)
+        },
+    }
+
+
+def _normalize_roi_test_label(value: object) -> str:
+    text = str(value).strip().upper()
+    if text in {"2D", "2-D", "2 D"}:
+        return "2D"
+    if text in {"3D", "3-D", "3 D"}:
+        return "3D"
+    return ""
+
+
+def _build_roi_classifier_label_table(results: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        image_name = str(result.get("sample", ""))
+        for roi_idx, roi_row in enumerate(result.get("roi_predictions", []), start=1):
+            roi_id = str(roi_row.get("roi_nummer", "")).strip() or f"roi{roi_idx}"
+            pred_label = _normalize_roi_test_label(roi_row.get("predicted_label", ""))
+            pred_conf = float(roi_row.get("predicted_probability", 0.0)) * 100.0
+            rows.append(
+                {
+                    "image_name": image_name,
+                    "roi_id": roi_id,
+                    "pred_roi_label": pred_label,
+                    "pred_confidence_percent": round(pred_conf, 2),
+                    "true_roi_label": "",
+                }
+            )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "image_name",
+            "roi_id",
+            "pred_roi_label",
+            "pred_confidence_percent",
+            "true_roi_label",
+        ],
+    )
+
+
+def _dataframe_to_xlsx_bytes(table: pd.DataFrame, sheet_name: str = "roi_labels") -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        table.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buffer.getvalue()
+
+
+def _component_test_overlays_to_zip_bytes(results: list[dict[str, Any]]) -> bytes:
+    buffer = io.BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        manifest_rows: list[dict[str, Any]] = []
+        for index, result in enumerate(results, start=1):
+            overlay_rgb = result.get("overlay_rgb")
+            if overlay_rgb is None:
+                continue
+            overlay_array = np.asarray(overlay_rgb, dtype=np.uint8)
+            sample_name = str(result.get("sample", f"image_{index:04d}"))
+            stem = _safe_name(Path(sample_name).stem) or f"image_{index:04d}"
+            file_name = f"{stem}.png"
+            if file_name in used_names:
+                file_name = f"{index:04d}_{file_name}"
+            used_names.add(file_name)
+
+            image_buffer = io.BytesIO()
+            Image.fromarray(overlay_array).save(image_buffer, format="PNG")
+            archive.writestr(file_name, image_buffer.getvalue())
+            manifest_rows.append(
+                {
+                    "order": index,
+                    "sample": sample_name,
+                    "overlay_file": file_name,
+                    "part_label": str(result.get("part_label", "")),
+                    "num_rois": int(result.get("num_rois", 0)),
+                    "num_3d_rois": int(result.get("num_3d_rois", 0)),
+                }
+            )
+
+        if manifest_rows:
+            manifest_buffer = io.StringIO()
+            writer = csv.DictWriter(
+                manifest_buffer,
+                fieldnames=["order", "sample", "overlay_file", "part_label", "num_rois", "num_3d_rois"],
+            )
+            writer.writeheader()
+            writer.writerows(manifest_rows)
+            archive.writestr("overlay_manifest.csv", manifest_buffer.getvalue())
+
+    return buffer.getvalue()
+
+
+def _read_uploaded_label_table(uploaded_file: Any) -> pd.DataFrame:
+    name = str(getattr(uploaded_file, "name", "")).lower()
+    data = uploaded_file.getvalue()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(io.BytesIO(data))
+    return pd.read_csv(io.BytesIO(data), sep=None, engine="python")
+
+
+def _evaluate_roi_classifier_label_table(table: pd.DataFrame) -> dict[str, Any]:
+    required_columns = {"image_name", "roi_id", "pred_roi_label", "true_roi_label"}
+    missing = sorted(required_columns - set(table.columns))
+    if missing:
+        raise ValueError(f"Pflichtspalten fehlen: {', '.join(missing)}")
+
+    eval_table = table.copy()
+    eval_table["image_name"] = eval_table["image_name"].astype(str)
+    eval_table["roi_id"] = eval_table["roi_id"].astype(str)
+    eval_table["pred_roi_label"] = eval_table["pred_roi_label"].map(_normalize_roi_test_label)
+    eval_table["true_roi_label"] = eval_table["true_roi_label"].map(_normalize_roi_test_label)
+    eval_table = eval_table[
+        eval_table["pred_roi_label"].isin(["2D", "3D"])
+        & eval_table["true_roi_label"].isin(["2D", "3D"])
+    ].copy()
+    if eval_table.empty:
+        raise ValueError("Keine auswertbaren ROI-Zeilen gefunden. Fuell die Spalte true_roi_label mit 2D oder 3D.")
+
+    roi_metrics = _compute_binary_roi_metrics(
+        eval_table["true_roi_label"].tolist(),
+        eval_table["pred_roi_label"].tolist(),
+    )
+
+    part_rows: list[dict[str, Any]] = []
+    for image_name, image_df in eval_table.groupby("image_name", sort=True):
+        true_part_label = "3D" if (image_df["true_roi_label"] == "3D").any() else "2D"
+        pred_part_label = "3D" if (image_df["pred_roi_label"] == "3D").any() else "2D"
+        part_rows.append(
+            {
+                "image_name": str(image_name),
+                "true_part_label": true_part_label,
+                "pred_part_label": pred_part_label,
+                "num_rois": int(image_df.shape[0]),
+                "num_true_3d_rois": int((image_df["true_roi_label"] == "3D").sum()),
+                "num_pred_3d_rois": int((image_df["pred_roi_label"] == "3D").sum()),
+            }
+        )
+    part_table = pd.DataFrame(part_rows)
+    part_metrics = _compute_binary_roi_metrics(
+        part_table["true_part_label"].tolist(),
+        part_table["pred_part_label"].tolist(),
+    )
+    return {
+        "roi_table": eval_table,
+        "part_table": part_table,
+        "roi_metrics": roi_metrics,
+        "part_metrics": part_metrics,
+    }
+
+
+def _confusion_matrix_dataframe(metrics: dict[str, Any]) -> pd.DataFrame:
+    labels = list(metrics.get("labels", ["2D", "3D"]))
+    return pd.DataFrame(
+        np.asarray(metrics.get("confusion_matrix", np.zeros((len(labels), len(labels)), dtype=int))),
+        index=[f"true_{label}" for label in labels],
+        columns=[f"pred_{label}" for label in labels],
+    )
 
 
 def _aggregate_part_level_predictions(image_result_rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -1264,48 +1199,6 @@ def _save_test_dataset_evaluation_artifacts(
     }
 
 
-@st.cache_resource(show_spinner="Baue Top1-Patch-Klassifikator-Endmodell...")
-def load_top1patch_classifier_model(
-    experiment_dir_str: str,
-    seed: int,
-    cache_signature: tuple[tuple[str, int, int], ...],
-) -> dict[str, Any]:
-    experiment_dir = Path(experiment_dir_str).resolve()
-    selection_path = experiment_dir / TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR / "selected_topk_features.csv"
-    model_info_path = experiment_dir / TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR / "model_info.json"
-    summary_path = experiment_dir / TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR / "summary.json"
-    classifier_path = experiment_dir / TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR / "classifier_pipeline.joblib"
-    scale_sqrt_path = experiment_dir / TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR / "irelief_feature_scale_sqrt.npy"
-    if not selection_path.exists():
-        raise FileNotFoundError(f"Top1-Patch-Klassifikator-Featuredatei nicht gefunden: {selection_path}")
-    if not classifier_path.exists():
-        raise FileNotFoundError(f"Top1-Patch-Klassifikator-Modell nicht gefunden: {classifier_path}")
-    if not scale_sqrt_path.exists():
-        raise FileNotFoundError(f"Top1-Patch-I-Relief-Scale-Datei nicht gefunden: {scale_sqrt_path}")
-
-    selection_df = pd.read_csv(selection_path)
-    if "feature_index" not in selection_df.columns:
-        raise ValueError(f"'feature_index' fehlt in {selection_path}")
-    selected_indices = selection_df["feature_index"].astype(np.int32).to_numpy()
-    fixed_k = int(selected_indices.size)
-    _ = cache_signature
-    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
-    model_info = json.loads(model_info_path.read_text(encoding="utf-8")) if model_info_path.exists() else {}
-    model = joblib_load(classifier_path)
-    scale_sqrt = np.load(scale_sqrt_path).astype(np.float32)
-
-    selection_mode = str(summary.get("selection_mode", model_info.get("selection_mode", "overlap")))
-    patch_count = int(summary.get("patch_count", 1))
-    return {
-        "model": model,
-        "selected_indices": selected_indices,
-        "scale_sqrt": scale_sqrt,
-        "selection_mode": selection_mode,
-        "patch_count": int(patch_count),
-        "fixed_k": int(selected_indices.size),
-        "sigma": float(summary.get("sigma", np.nan)),
-        "irelief_iterations": int(summary.get("irelief_iterations", 0)),
-    }
 
 
 @st.cache_data(show_spinner=False)
@@ -1887,6 +1780,8 @@ def _run_component_test_for_external_image(
     classifier_info: dict[str, Any],
     render_overlays: bool,
     roi_logic_key: str = DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY,
+    albedo_image_rgb: np.ndarray | None = None,
+    overlay_on_albedo: bool = False,
 ) -> dict[str, Any]:
     experiment_dir = Path(experiment_dir_str).resolve()
     live_config = load_component_test_live_config(
@@ -1896,6 +1791,17 @@ def _run_component_test_for_external_image(
 
     backbone = load_component_test_backbone(experiment_dir_str)
     model = backbone["model"]
+    requires_albedo = bool(classifier_info.get("requires_albedo", False))
+    if requires_albedo and albedo_image_rgb is None:
+        raise ValueError("Fuer das Fusionsmodell fehlt das zum Normalmapbild passende Albedobild.")
+    if overlay_on_albedo and not requires_albedo:
+        raise ValueError("Ein Albedo-Overlay ist nur mit dem Fusionsklassifikator verfuegbar.")
+    if albedo_image_rgb is not None and tuple(albedo_image_rgb.shape[:2]) != tuple(image_rgb.shape[:2]):
+        raise ValueError(
+            "Normalmap und Albedo haben unterschiedliche Bildgroessen: "
+            f"{image_rgb.shape[1]}x{image_rgb.shape[0]} vs. "
+            f"{albedo_image_rgb.shape[1]}x{albedo_image_rgb.shape[0]}"
+        )
     confirmed_config = load_anomaly_detection_confirmed_config(experiment_dir_str, object_name)
     if confirmed_config is not None:
         reference_paths = _resolve_confirmed_reference_paths(experiment_dir_str, object_name, confirmed_config)
@@ -1995,18 +1901,46 @@ def _run_component_test_for_external_image(
             part_label = "NIO_no_roi"
             note = "Bild ist ueber dem Bildthreshold, aber aus der frischen ROI-Extraktion kamen keine ROIs."
         else:
+            albedo_multilayer_assets = None
+            if requires_albedo:
+                assert albedo_image_rgb is not None
+                albedo_tensor, albedo_grid_shape = model.prepare_image(albedo_image_rgb)
+                albedo_features_layers, albedo_layer_indices = model.extract_multilayer_features(
+                    albedo_tensor,
+                    layer_indices=list(range(1, 13)),
+                )
+                if tuple(int(v) for v in albedo_grid_shape) != tuple(int(v) for v in grid_shape):
+                    raise ValueError(
+                        "Normalmap und Albedo erzeugen unterschiedliche DINOv3-Patchgitter: "
+                        f"{grid_shape} vs. {albedo_grid_shape}"
+                    )
+                if tuple(int(v) for v in albedo_layer_indices) != tuple(range(1, 13)):
+                    raise ValueError(
+                        f"Unerwartete DINOv3-Albedolayer: {tuple(albedo_layer_indices)}"
+                    )
+                albedo_multilayer_assets = {
+                    "features_layers": np.asarray(albedo_features_layers, dtype=np.float32),
+                    "grid_shape": tuple(int(v) for v in albedo_grid_shape),
+                    "layer_indices": tuple(int(v) for v in albedo_layer_indices),
+                }
             roi_prediction_rows = _classify_component_sample_rois(
                 sample_assets=sample_assets,
                 multilayer_assets=multilayer_assets,
                 roi_rows=roi_rows,
                 classifier_info=classifier_info,
+                albedo_multilayer_assets=albedo_multilayer_assets,
             )
             part_label = "3D" if any(row["predicted_label"] == "3D" for row in roi_prediction_rows) else "2D"
 
     overlay_rgb = None
     if render_overlays:
+        overlay_assets = sample_assets
+        if overlay_on_albedo:
+            assert albedo_image_rgb is not None
+            overlay_assets = dict(sample_assets)
+            overlay_assets["image_rgb"] = albedo_image_rgb
         overlay_rgb = _render_component_test_overlay(
-            sample_assets=sample_assets,
+            sample_assets=overlay_assets,
             roi_prediction_rows=roi_prediction_rows,
             part_label=part_label,
         )
@@ -2033,6 +1967,7 @@ def _run_component_test_for_external_image(
         "note": note,
         "roi_predictions": roi_prediction_rows,
         "overlay_rgb": overlay_rgb,
+        "overlay_modality": "albedo" if overlay_on_albedo else "normalmap",
         "roi_extraction_logic": str(roi_logic_key),
     }
 
@@ -2131,20 +2066,58 @@ def load_mrmr_component_classifier_model(
     )
 
 
-def _roi_patch_box_to_display_box(
-    image_rgb: np.ndarray,
-    grid_shape: tuple[int, int],
-    row_min: int,
-    row_max: int,
-    col_min: int,
-    col_max: int,
-) -> tuple[int, int, int, int]:
-    row_edges, col_edges = _grid_edges(image_rgb.shape, grid_shape)
-    x0 = int(col_edges[col_min])
-    y0 = int(row_edges[row_min])
-    x1 = int(col_edges[col_max + 1])
-    y1 = int(row_edges[row_max + 1])
-    return x0, y0, x1, y1
+@st.cache_resource(show_spinner="Lade Normalmap-Albedo-Fusionsklassifikator...")
+def load_boruta_albedo_fusion_component_classifier_model(
+    experiment_dir_str: str,
+    cache_signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    classifier_dir = (
+        Path(experiment_dir_str).resolve()
+        / BORUTA_ALBEDO_FUSION_COMPONENT_CLASSIFIER_FEATURE_SUBDIR
+    )
+    classifier_path = classifier_dir / "classifier_pipeline.joblib"
+    normal_indices_path = classifier_dir / "selected_normal_feature_indices.npy"
+    albedo_indices_path = classifier_dir / "selected_albedo_feature_indices.npy"
+    model_info_path = classifier_dir / "model_info.json"
+
+    required_paths = [classifier_path, normal_indices_path, albedo_indices_path, model_info_path]
+    missing_paths = [path for path in required_paths if not path.exists()]
+    if missing_paths:
+        raise FileNotFoundError(
+            "Fusionsmodell ist unvollstaendig: "
+            + ", ".join(str(path) for path in missing_paths)
+        )
+
+    _ = cache_signature
+    normal_indices = np.load(normal_indices_path).astype(np.int32)
+    albedo_indices = np.load(albedo_indices_path).astype(np.int32)
+    if normal_indices.size != 152 or albedo_indices.size != 128:
+        raise ValueError(
+            "Unerwartete Merkmalsanzahl des Fusionsmodells: "
+            f"Normalmap={normal_indices.size}, Albedo={albedo_indices.size}"
+        )
+
+    model_info = json.loads(model_info_path.read_text(encoding="utf-8"))
+    probability_threshold_3d = float(model_info.get("probability_threshold_3d", float("nan")))
+    if not np.isfinite(probability_threshold_3d) or not 0.0 <= probability_threshold_3d <= 1.0:
+        raise ValueError(
+            "Im Fusionsmodell fehlt ein gueltiger probability_threshold_3d in model_info.json."
+        )
+
+    return {
+        "model": joblib_load(classifier_path),
+        "normal_selected_indices": normal_indices,
+        "albedo_selected_indices": albedo_indices,
+        "model_info": model_info,
+        "selected_feature_count": int(normal_indices.size + albedo_indices.size),
+        "classifier_dir": str(classifier_dir),
+        "classifier_label": "Normalmap + Albedo",
+        "classifier_subdir": BORUTA_ALBEDO_FUSION_COMPONENT_CLASSIFIER_FEATURE_SUBDIR,
+        "requires_albedo": True,
+        "probability_threshold_3d": probability_threshold_3d,
+    }
+
+
 
 
 def _classify_component_sample_rois(
@@ -2152,6 +2125,7 @@ def _classify_component_sample_rois(
     multilayer_assets: dict[str, Any],
     roi_rows: pd.DataFrame,
     classifier_info: dict[str, Any],
+    albedo_multilayer_assets: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if roi_rows.empty:
         return []
@@ -2162,7 +2136,26 @@ def _classify_component_sample_rois(
     cache_meta = multilayer_assets["cache_meta"]
     grid_shape = tuple(int(v) for v in multilayer_assets["grid_shape"])
     features_layers = np.asarray(multilayer_assets["features_layers"], dtype=np.float32)
-    selected_indices = np.asarray(classifier_info["selected_indices"], dtype=np.int32)
+    requires_albedo = bool(classifier_info.get("requires_albedo", False))
+    if requires_albedo:
+        if albedo_multilayer_assets is None:
+            raise ValueError("Der ausgewaehlte Klassifikator benoetigt ein passendes Albedobild.")
+        albedo_grid_shape = tuple(int(v) for v in albedo_multilayer_assets["grid_shape"])
+        if albedo_grid_shape != grid_shape:
+            raise ValueError(
+                f"Patchgitter von Normalmap und Albedo unterscheiden sich: {grid_shape} vs. {albedo_grid_shape}"
+            )
+        albedo_features_layers = np.asarray(
+            albedo_multilayer_assets["features_layers"], dtype=np.float32
+        )
+        normal_selected_indices = np.asarray(
+            classifier_info["normal_selected_indices"], dtype=np.int32
+        )
+        albedo_selected_indices = np.asarray(
+            classifier_info["albedo_selected_indices"], dtype=np.int32
+        )
+    else:
+        selected_indices = np.asarray(classifier_info["selected_indices"], dtype=np.int32)
 
     for roi_row in roi_rows.itertuples(index=False):
         row_series = pd.Series(roi_row._asdict())
@@ -2177,7 +2170,21 @@ def _classify_component_sample_rois(
             selected_patches=selected_patches,
             grid_shape=grid_shape,
         )
-        selected_feature_rows.append(combined_feature[selected_indices].astype(np.float32))
+        if requires_albedo:
+            combined_albedo_feature = aggregate_maxminmean_per_layer(
+                features_layers=albedo_features_layers,
+                selected_patches=selected_patches,
+                grid_shape=albedo_grid_shape,
+            )
+            selected_feature = np.concatenate(
+                [
+                    combined_feature[normal_selected_indices],
+                    combined_albedo_feature[albedo_selected_indices],
+                ]
+            )
+        else:
+            selected_feature = combined_feature[selected_indices]
+        selected_feature_rows.append(selected_feature.astype(np.float32))
         roi_prediction_rows.append(
             {
                 "sample": sample_assets["sample"],
@@ -2203,8 +2210,13 @@ def _classify_component_sample_rois(
 
     X = np.stack(selected_feature_rows, axis=0).astype(np.float32)
     model = classifier_info["model"]
-    pred_labels = model.predict(X)
     pred_proba = model.predict_proba(X).astype(np.float32)
+    probability_threshold_3d = classifier_info.get("probability_threshold_3d")
+    if probability_threshold_3d is None:
+        pred_labels = model.predict(X)
+    else:
+        probability_threshold_3d = float(probability_threshold_3d)
+        pred_labels = (pred_proba[:, 1] >= probability_threshold_3d).astype(np.int32)
 
     for row_dict, pred_label_raw, proba in zip(roi_prediction_rows, pred_labels, pred_proba):
         pred_label = "3D" if int(pred_label_raw) == 1 else "2D"
@@ -2213,6 +2225,7 @@ def _classify_component_sample_rois(
         row_dict["predicted_probability"] = predicted_probability
         row_dict["proba_2d"] = float(proba[0])
         row_dict["proba_3d"] = float(proba[1])
+        row_dict["decision_threshold_3d"] = probability_threshold_3d
 
     return roi_prediction_rows
 
@@ -2228,14 +2241,15 @@ def _render_component_test_overlay(
     roi_boxes: list[tuple[dict[str, Any], tuple[int, int, int, int]]] = []
 
     for row_dict in roi_prediction_rows:
-        x0, y0, x1, y1 = _roi_patch_box_to_display_box(
-            image_rgb=overlay,
-            grid_shape=grid_shape,
-            row_min=int(row_dict["region_row_min"]),
-            row_max=int(row_dict["region_row_max"]),
-            col_min=int(row_dict["region_col_min"]),
-            col_max=int(row_dict["region_col_max"]),
-        )
+        # The ROI extraction already maps patch boxes back to image coordinates while
+        # accounting for DINO resize/crop-to-patch-multiple behavior. Reusing these
+        # coordinates avoids a horizontal/vertical overlay drift from re-scaling the
+        # patch grid over the uncropped image extent.
+        image_h, image_w = overlay.shape[:2]
+        x0 = max(0, min(int(row_dict["x_min"]), image_w - 1))
+        y0 = max(0, min(int(row_dict["y_min"]), image_h - 1))
+        x1 = max(x0 + 1, min(int(row_dict["x_max"]), image_w))
+        y1 = max(y0 + 1, min(int(row_dict["y_max"]), image_h))
         roi_boxes.append((row_dict, (x0, y0, x1, y1)))
 
     blocked_rects = [box for _, box in roi_boxes]
@@ -2263,162 +2277,14 @@ def _render_component_test_overlay(
     return overlay
 
 
-def _load_irelief_scale_weights_from_subdir(experiment_dir_str: str, subdir: str) -> dict[str, Any]:
-    experiment_dir = Path(experiment_dir_str).resolve()
-    scale_path = experiment_dir / subdir / "irelief_feature_scale_sqrt.npy"
-    weight_path = experiment_dir / subdir / "irelief_feature_weights.npy"
-    summary_path = experiment_dir / subdir / "summary.json"
-    if not scale_path.exists():
-        raise FileNotFoundError(f"I-Relief-Scale-Datei nicht gefunden: {scale_path}")
-
-    scale = np.load(scale_path).astype(np.float32)
-    if scale.ndim != 1:
-        raise ValueError(f"I-Relief scale must be 1D, got shape {scale.shape}")
-
-    result: dict[str, Any] = {
-        "scale_sqrt": scale,
-        "scale_path": str(scale_path),
-        "feature_dim": int(scale.shape[0]),
-        "subdir": subdir,
-    }
-    if weight_path.exists():
-        weights = np.load(weight_path).astype(np.float32)
-        if weights.ndim == 1 and weights.shape[0] == scale.shape[0]:
-            result["weights"] = weights
-    if summary_path.exists():
-        result["summary_path"] = str(summary_path)
-        result["summary"] = json.loads(summary_path.read_text(encoding="utf-8"))
-    return result
 
 
-def _orthonormalize_patch_basis(candidates: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    num_positions, num_components, feature_dim = candidates.shape
-    basis = np.zeros((num_positions, num_components, feature_dim), dtype=np.float32)
-
-    v1 = candidates[:, 0, :].astype(np.float32)
-    n1 = np.linalg.norm(v1, axis=1, keepdims=True)
-    mask1 = n1[:, 0] > eps
-    if np.any(mask1):
-        basis[mask1, 0, :] = v1[mask1] / n1[mask1]
-
-    for comp_idx in range(1, num_components):
-        vk = candidates[:, comp_idx, :].astype(np.float32)
-        for prev_idx in range(comp_idx):
-            prev = basis[:, prev_idx, :]
-            proj = np.sum(vk * prev, axis=1, keepdims=True)
-            vk = vk - proj * prev
-        nk = np.linalg.norm(vk, axis=1, keepdims=True)
-        maskk = nk[:, 0] > eps
-        if np.any(maskk):
-            basis[maskk, comp_idx, :] = vk[maskk] / nk[maskk]
-
-    return basis
 
 
-def _build_positional_pca_reference_impl(
-    experiment_dir_str: str,
-    seed: int,
-    feature_source: str,
-    num_components: int = 2,
-    num_power_iterations: int = 3,
-) -> dict[str, Any]:
-    if num_components < 1:
-        raise ValueError("num_components must be >= 1")
-
-    if feature_source == "normal":
-        mean_reference = load_positional_reference(experiment_dir_str, seed)
-    elif feature_source == "albedo":
-        mean_reference = load_albedo_positional_reference(experiment_dir_str, seed)
-    else:
-        raise ValueError(f"Unsupported feature_source: {feature_source}")
-    mean_vectors = np.asarray(mean_reference["reference_vectors"], dtype=np.float32)
-    context = load_run_context(experiment_dir_str, seed)
-    good_rows = [row for row in context["samples"] if int(row["image_label"]) == 0]
-    if not good_rows:
-        raise ValueError("Keine good-Bilder fuer die PCA-Referenz gefunden.")
-
-    num_positions, feature_dim = mean_vectors.shape
-    rng = np.random.default_rng(0)
-    init = rng.standard_normal((num_positions, num_components, feature_dim), dtype=np.float32)
-    basis = _orthonormalize_patch_basis(init)
-
-    class _SampleProxy:
-        def __init__(self, image_path: str, feature_cache_path: str, anomaly_map_path: str) -> None:
-            self.image_path = Path(image_path)
-            self.feature_cache_path = Path(feature_cache_path)
-            self.anomaly_map_path = Path(anomaly_map_path)
-
-    valid_counts = np.zeros((num_positions,), dtype=np.int32)
-    for _ in range(num_power_iterations):
-        accum = np.zeros((num_positions, num_components, feature_dim), dtype=np.float64)
-        valid_counts[:] = 0
-        for row in good_rows:
-            proxy = _SampleProxy(
-                image_path=row["image_path"],
-                feature_cache_path=row["feature_cache_path"],
-                anomaly_map_path=row["anomaly_map_path"],
-            )
-            score_grid = load_patch_scores(proxy)
-            features_norm, _ = _load_normalized_features_for_reference(
-                experiment_dir_str,
-                seed,
-                row,
-                feature_source=feature_source,
-            )
-
-            valid_mask = (score_grid.reshape(-1) <= float(row["image_threshold"])).astype(np.float32)
-            projection_mean = np.sum(features_norm * mean_vectors, axis=1, keepdims=True)
-            residual = features_norm - projection_mean * mean_vectors
-
-            proj = np.einsum("pd,pkd->pk", residual, basis, optimize=True)
-            accum += residual[:, None, :] * proj[:, :, None] * valid_mask[:, None, None]
-            valid_counts += valid_mask.astype(np.int32)
-
-        basis = _orthonormalize_patch_basis(accum.astype(np.float32))
-
-    return {
-        "mean_reference": mean_reference,
-        "basis": basis,
-        "num_components": int(num_components),
-        "num_power_iterations": int(num_power_iterations),
-        "num_good_images": len(good_rows),
-        "num_positions_with_valid_mask": int(np.sum(valid_counts > 0)),
-        "count_valid_min": int(valid_counts.min()),
-        "count_valid_max": int(valid_counts.max()),
-        "count_valid_mean": float(valid_counts.mean()),
-    }
 
 
-@st.cache_data(show_spinner="Baue kleinen PCA-Subspace aus guten Bildern...")
-def load_positional_pca_reference(
-    experiment_dir_str: str,
-    seed: int,
-    num_components: int = 2,
-    num_power_iterations: int = 3,
-) -> dict[str, Any]:
-    return _build_positional_pca_reference_impl(
-        experiment_dir_str,
-        seed,
-        feature_source="normal",
-        num_components=num_components,
-        num_power_iterations=num_power_iterations,
-    )
 
 
-@st.cache_data(show_spinner="Baue kleinen Albedo-PCA-Subspace aus guten Bildern...")
-def load_albedo_positional_pca_reference(
-    experiment_dir_str: str,
-    seed: int,
-    num_components: int = 2,
-    num_power_iterations: int = 3,
-) -> dict[str, Any]:
-    return _build_positional_pca_reference_impl(
-        experiment_dir_str,
-        seed,
-        feature_source="albedo",
-        num_components=num_components,
-        num_power_iterations=num_power_iterations,
-    )
 
 
 def _prepare_display_image(image_path: Path, smaller_edge_size: int, patch_size: int) -> np.ndarray:
@@ -2435,367 +2301,36 @@ def _prepare_display_image(image_path: Path, smaller_edge_size: int, patch_size:
     return image_np[:cropped_h, :cropped_w].copy()
 
 
-def _grid_edges(image_shape: tuple[int, int, int], grid_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    h, w = image_shape[:2]
-    rows, cols = grid_shape
-    row_edges = np.linspace(0, h, rows + 1).round().astype(int)
-    col_edges = np.linspace(0, w, cols + 1).round().astype(int)
-    return row_edges, col_edges
 
 
-def _draw_patch_grid(image_rgb: np.ndarray, grid_shape: tuple[int, int], color=(220, 220, 220)) -> np.ndarray:
-    canvas = image_rgb.copy()
-    row_edges, col_edges = _grid_edges(canvas.shape, grid_shape)
-    for y in row_edges:
-        cv2.line(canvas, (0, int(y)), (canvas.shape[1] - 1, int(y)), color, 1, lineType=cv2.LINE_AA)
-    for x in col_edges:
-        cv2.line(canvas, (int(x), 0), (int(x), canvas.shape[0] - 1), color, 1, lineType=cv2.LINE_AA)
-    return canvas
 
 
-def _resize_grid(grid: np.ndarray, image_shape: tuple[int, int, int], interpolation: int) -> np.ndarray:
-    h, w = image_shape[:2]
-    return cv2.resize(grid.astype(np.float32), (w, h), interpolation=interpolation)
 
 
-def _blend(base_rgb: np.ndarray, overlay_rgb: np.ndarray, alpha: float) -> np.ndarray:
-    return cv2.addWeighted(base_rgb, 1.0 - alpha, overlay_rgb, alpha, 0.0)
 
 
-def _mark_query_patch(
-    canvas: np.ndarray,
-    grid_shape: tuple[int, int],
-    row: int,
-    col: int,
-    label: str | None = None,
-    box_color: tuple[int, int, int] = (255, 255, 255),
-    marker_color: tuple[int, int, int] = (255, 0, 0),
-) -> np.ndarray:
-    out = canvas.copy()
-    row_edges, col_edges = _grid_edges(out.shape, grid_shape)
-    y0, y1 = row_edges[row], row_edges[row + 1]
-    x0, x1 = col_edges[col], col_edges[col + 1]
-    cx = (x0 + x1) // 2
-    cy = (y0 + y1) // 2
-    cv2.rectangle(out, (x0, y0), (x1 - 1, y1 - 1), box_color, 2)
-    cv2.drawMarker(
-        out,
-        (cx, cy),
-        marker_color,
-        markerType=cv2.MARKER_CROSS,
-        markerSize=max(10, min(x1 - x0, y1 - y0) - 2),
-        thickness=2,
-        line_type=cv2.LINE_AA,
-    )
-    if label:
-        cv2.putText(
-            out,
-            label,
-            (x0 + 3, min(y1 - 4, y0 + 18)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            2,
-            lineType=cv2.LINE_AA,
-        )
-    return out
 
 
-def _render_marked_patches(
-    image_rgb: np.ndarray,
-    grid_shape: tuple[int, int],
-    selected_patches: list[tuple[int, int]] | None,
-) -> np.ndarray:
-    canvas = _draw_patch_grid(image_rgb, grid_shape)
-    if selected_patches:
-        for index, (row, col) in enumerate(selected_patches, start=1):
-            canvas = _mark_query_patch(
-                canvas,
-                grid_shape,
-                row,
-                col,
-                label=str(index),
-            )
-    return canvas
 
 
-def _render_anomaly_overlay(
-    image_rgb: np.ndarray,
-    score_grid: np.ndarray,
-    marked_patches: list[tuple[int, int]] | None,
-) -> np.ndarray:
-    resized = _resize_grid(score_grid, image_rgb.shape, cv2.INTER_LINEAR)
-    resized = resized - resized.min()
-    denom = float(resized.max())
-    if denom > 0:
-        resized = resized / denom
-    heat = cv2.applyColorMap((resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
-    overlay = _blend(image_rgb, heat, 0.45)
-    overlay = _draw_patch_grid(overlay, score_grid.shape)
-    if marked_patches:
-        for index, (row, col) in enumerate(marked_patches, start=1):
-            overlay = _mark_query_patch(overlay, score_grid.shape, row, col, label=str(index))
-    return overlay
 
 
-def _render_similarity_overlay(
-    image_rgb: np.ndarray,
-    sim_grid: np.ndarray,
-    marked_patches: list[tuple[int, int]] | None,
-    top_matches: list[tuple[int, int]] | None = None,
-    valid_mask_grid: np.ndarray | None = None,
-) -> np.ndarray:
-    resized = _resize_grid(sim_grid, image_rgb.shape, cv2.INTER_LINEAR)
-    valid_mask_resized = None
-    if valid_mask_grid is not None:
-        valid_mask_resized = _resize_grid(valid_mask_grid.astype(np.float32), image_rgb.shape, cv2.INTER_NEAREST) >= 0.5
-        finite_values = resized[valid_mask_resized]
-    else:
-        finite_values = resized.reshape(-1)
-
-    finite_values = finite_values[np.isfinite(finite_values)]
-    if finite_values.size > 0:
-        sim_min = float(finite_values.min())
-        sim_max = float(finite_values.max())
-    else:
-        sim_min = 0.0
-        sim_max = 0.0
-
-    if sim_max > sim_min:
-        normalized = (resized - sim_min) / (sim_max - sim_min)
-        normalized = np.clip(normalized, 0.0, 1.0)
-    else:
-        normalized = np.zeros_like(resized, dtype=np.float32)
-    heat = cv2.applyColorMap((normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-    heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
-    blended = _blend(image_rgb, heat, 0.50)
-    if valid_mask_resized is None:
-        overlay = blended
-    else:
-        overlay = image_rgb.copy()
-        overlay[valid_mask_resized] = blended[valid_mask_resized]
-        overlay[~valid_mask_resized] = (image_rgb[~valid_mask_resized] * 0.35).astype(np.uint8)
-    overlay = _draw_patch_grid(overlay, sim_grid.shape)
-    if marked_patches:
-        for index, (row, col) in enumerate(marked_patches, start=1):
-            overlay = _mark_query_patch(overlay, sim_grid.shape, row, col, label=str(index))
-
-    if top_matches:
-        row_edges, col_edges = _grid_edges(overlay.shape, sim_grid.shape)
-        for rank, (row, col) in enumerate(top_matches, start=1):
-            y0, y1 = row_edges[row], row_edges[row + 1]
-            x0, x1 = col_edges[col], col_edges[col + 1]
-            cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (255, 255, 0), 2)
-            cv2.putText(
-                overlay,
-                str(rank),
-                (x0 + 3, min(y1 - 4, y0 + 18)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 255),
-                2,
-                lineType=cv2.LINE_AA,
-            )
-    return overlay
 
 
-def _pixel_to_patch(
-    image_shape: tuple[int, int, int],
-    grid_shape: tuple[int, int],
-    click_payload: dict[str, Any],
-) -> tuple[int, int] | None:
-    if not click_payload:
-        return None
-
-    width = int(click_payload.get("width", image_shape[1]))
-    height = int(click_payload.get("height", image_shape[0]))
-    if width <= 0 or height <= 0:
-        return None
-
-    x = float(click_payload.get("x", 0.0)) * image_shape[1] / width
-    y = float(click_payload.get("y", 0.0)) * image_shape[0] / height
-    x = min(max(x, 0.0), image_shape[1] - 1)
-    y = min(max(y, 0.0), image_shape[0] - 1)
-
-    rows, cols = grid_shape
-    row_edges = np.linspace(0, image_shape[0], rows + 1).round().astype(int)
-    col_edges = np.linspace(0, image_shape[1], cols + 1).round().astype(int)
-    row = int(np.searchsorted(row_edges, y, side="right") - 1)
-    col = int(np.searchsorted(col_edges, x, side="right") - 1)
-    row = min(max(row, 0), rows - 1)
-    col = min(max(col, 0), cols - 1)
-    return row, col
 
 
-def _patch_crop(image_rgb: np.ndarray, grid_shape: tuple[int, int], row: int, col: int, pad: int = 0) -> np.ndarray:
-    row_edges, col_edges = _grid_edges(image_rgb.shape, grid_shape)
-    y0, y1 = row_edges[row], row_edges[row + 1]
-    x0, x1 = col_edges[col], col_edges[col + 1]
-    y0 = max(0, y0 - pad)
-    x0 = max(0, x0 - pad)
-    y1 = min(image_rgb.shape[0], y1 + pad)
-    x1 = min(image_rgb.shape[1], x1 + pad)
-    return image_rgb[y0:y1, x0:x1].copy()
 
 
-def _resize_keep_aspect(image_rgb: np.ndarray, target_height: int) -> np.ndarray:
-    if image_rgb.shape[0] == target_height:
-        return image_rgb.copy()
-    scale = target_height / image_rgb.shape[0]
-    target_width = max(1, int(round(image_rgb.shape[1] * scale)))
-    return cv2.resize(image_rgb, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
-def _make_titled_panel(image_rgb: np.ndarray, title: str, target_height: int | None = None) -> np.ndarray:
-    content = image_rgb.copy()
-    if target_height is not None:
-        content = _resize_keep_aspect(content, target_height)
-    title_bar_h = 34
-    panel = np.full((content.shape[0] + title_bar_h, content.shape[1], 3), 24, dtype=np.uint8)
-    panel[title_bar_h:, :, :] = content
-    cv2.putText(
-        panel,
-        title,
-        (10, 22),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        (255, 255, 255),
-        2,
-        lineType=cv2.LINE_AA,
-    )
-    return panel
 
 
-def _stack_row(images: list[np.ndarray], pad: int = 12, bg_color: int = 18) -> np.ndarray:
-    if not images:
-        raise ValueError("stack_row requires at least one image")
-    max_h = max(img.shape[0] for img in images)
-    total_w = sum(img.shape[1] for img in images) + pad * (len(images) - 1)
-    canvas = np.full((max_h, total_w, 3), bg_color, dtype=np.uint8)
-    x = 0
-    for img in images:
-        y = (max_h - img.shape[0]) // 2
-        canvas[y : y + img.shape[0], x : x + img.shape[1]] = img
-        x += img.shape[1] + pad
-    return canvas
 
 
-def _stack_col(images: list[np.ndarray], pad: int = 12, bg_color: int = 18) -> np.ndarray:
-    if not images:
-        raise ValueError("stack_col requires at least one image")
-    max_w = max(img.shape[1] for img in images)
-    total_h = sum(img.shape[0] for img in images) + pad * (len(images) - 1)
-    canvas = np.full((total_h, max_w, 3), bg_color, dtype=np.uint8)
-    y = 0
-    for img in images:
-        x = (max_w - img.shape[1]) // 2
-        canvas[y : y + img.shape[0], x : x + img.shape[1]] = img
-        y += img.shape[0] + pad
-    return canvas
 
 
-def _build_match_strip(
-    target_assets: dict[str, Any],
-    matches: list[tuple[int, int, float]],
-    max_items: int = 6,
-) -> np.ndarray | None:
-    tiles: list[np.ndarray] = []
-    for rank, (row, col, similarity) in enumerate(matches[:max_items], start=1):
-        crop = _patch_crop(target_assets["image_rgb"], target_assets["grid_shape"], row, col, pad=0)
-        title = f"#{rank} r={row} c={col} sim={similarity:.3f}"
-        tiles.append(_make_titled_panel(crop, title, target_height=140))
-    if not tiles:
-        return None
-    return _stack_row(tiles, pad=10, bg_color=18)
 
 
-def _export_current_view(
-    experiment_dir_str: str,
-    seed: int,
-    query_assets: dict[str, Any],
-    target_assets: dict[str, Any],
-    query_patches: list[tuple[int, int]],
-    query_details: list[dict[str, Any]],
-    query_panel: np.ndarray,
-    similarity_panel: np.ndarray,
-    query_strip: np.ndarray | None,
-    target_anomaly_panel: np.ndarray | None,
-    match_strip: np.ndarray | None,
-    top_rows: list[dict[str, Any]],
-    sim_grid: np.ndarray,
-    target_filter_mode: str,
-    feature_mode: str,
-    feature_source_mode: str,
-    fusion_alpha_normal: float,
-    fusion_alpha_albedo: float,
-) -> tuple[Path, Path]:
-    export_dir = Path(experiment_dir_str).resolve() / EXPORT_SUBDIR / f"seed={seed}"
-    export_dir.mkdir(parents=True, exist_ok=True)
-
-    query_panel_sheet = _make_titled_panel(
-        query_panel,
-        f"Query: {query_assets['sample']} | patches={len(query_patches)}",
-        target_height=420,
-    )
-    similarity_panel_sheet = _make_titled_panel(
-        similarity_panel,
-        f"Target Similarity: {target_assets['sample']}",
-        target_height=420,
-    )
-    upper_row = _stack_row([query_panel_sheet, similarity_panel_sheet], pad=12, bg_color=18)
-
-    lower_panels = [
-    ]
-    if query_strip is not None:
-        lower_panels.append(query_strip)
-    if target_anomaly_panel is not None:
-        lower_panels.append(_make_titled_panel(target_anomaly_panel, "Target Anomaly Map", target_height=180))
-    if match_strip is not None:
-        lower_panels.append(match_strip)
-    lower_row = _stack_row(lower_panels, pad=12, bg_color=18)
-
-    sheet = _stack_col([upper_row, lower_row], pad=12, bg_color=18)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    stem = (
-        f"{timestamp}__q_{_safe_name(query_assets['sample'])}__n{len(query_patches):02d}"
-        f"__t_{_safe_name(target_assets['sample'])}__src_{_safe_name(feature_source_mode)}"
-    )
-    png_path = export_dir / f"{stem}.png"
-    json_path = export_dir / f"{stem}.json"
-
-    Image.fromarray(sheet).save(png_path)
-    metadata = {
-        "timestamp": timestamp,
-        "experiment_dir": str(Path(experiment_dir_str).resolve()),
-        "seed": int(seed),
-        "query_sample": query_assets["sample"],
-        "target_sample": target_assets["sample"],
-        "query_patches": query_details,
-        "query_group": query_assets["evaluation_group"],
-        "target_group": target_assets["evaluation_group"],
-        "query_weight_mode": "softmax",
-        "target_filter_mode": target_filter_mode,
-        "feature_mode": feature_mode,
-        "feature_source_mode": feature_source_mode,
-        "fusion_alpha_normal": float(fusion_alpha_normal),
-        "fusion_alpha_albedo": float(fusion_alpha_albedo),
-        "query_image_score": float(query_assets["image_score"]),
-        "query_image_threshold": float(query_assets["image_threshold"]),
-        "target_image_score": float(target_assets["image_score"]),
-        "target_image_threshold": float(target_assets["image_threshold"]),
-        "grid_shape_query": list(query_assets["grid_shape"]),
-        "grid_shape_target": list(target_assets["grid_shape"]),
-        "similarity_min": float(sim_grid.min()),
-        "similarity_max": float(sim_grid.max()),
-        "top_matches": top_rows,
-        "png_path": str(png_path),
-    }
-    json_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    manifest_path = export_dir / "manifest.jsonl"
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(metadata, ensure_ascii=False) + "\n")
-    return png_path, json_path
 
 
 @st.cache_data(show_spinner=False)
@@ -2848,191 +2383,22 @@ def load_sample_assets(experiment_dir_str: str, seed: int, sample_name: str) -> 
     }
 
 
-def _softmax_query_weights(anomaly_scores: np.ndarray) -> np.ndarray:
-    if anomaly_scores.size == 0:
-        raise ValueError("No anomaly scores provided for query weighting")
-    if anomaly_scores.size == 1:
-        return np.array([1.0], dtype=np.float32)
-    score_min = float(anomaly_scores.min())
-    score_max = float(anomaly_scores.max())
-    if score_max <= score_min:
-        return np.full(anomaly_scores.shape, 1.0 / anomaly_scores.size, dtype=np.float32)
-    logits = (anomaly_scores - score_min) / max(score_max - score_min, 1e-8)
-    logits = logits - float(logits.max())
-    exp_logits = np.exp(logits).astype(np.float32)
-    return (exp_logits / max(float(exp_logits.sum()), 1e-8)).astype(np.float32)
 
 
-def _query_feature_from_selected(
-    features_norm: np.ndarray,
-    score_grid: np.ndarray,
-    grid_shape: tuple[int, int],
-    selected_patches: list[tuple[int, int]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    patch_features: list[np.ndarray] = []
-    anomaly_scores: list[float] = []
-    for row, col in selected_patches:
-        idx = row * grid_shape[1] + col
-        patch_features.append(features_norm[idx])
-        anomaly_scores.append(float(score_grid[row, col]))
-    feature_matrix = np.stack(patch_features, axis=0).astype(np.float32)
-    anomaly_array = np.array(anomaly_scores, dtype=np.float32)
-    weights = _softmax_query_weights(anomaly_array)
-    combined = (feature_matrix * weights[:, None]).sum(axis=0)
-    combined_norm = np.linalg.norm(combined)
-    if combined_norm <= 1e-8:
-        combined = feature_matrix.mean(axis=0)
-        combined_norm = np.linalg.norm(combined)
-    combined = (combined / max(float(combined_norm), 1e-8)).astype(np.float32)
-    return combined, anomaly_array, weights
 
 
-def _debiased_features(
-    features_norm: np.ndarray,
-    reference_vectors: np.ndarray,
-) -> np.ndarray:
-    if features_norm.shape != reference_vectors.shape:
-        raise ValueError(
-            f"Feature/reference shape mismatch: {features_norm.shape} vs {reference_vectors.shape}"
-        )
-    projection = np.sum(features_norm * reference_vectors, axis=1, keepdims=True)
-    residual = features_norm - projection * reference_vectors
-    residual_norm = np.linalg.norm(residual, axis=1, keepdims=True)
-    fallback_mask = residual_norm.squeeze(-1) <= 1e-8
-    residual_norm = np.maximum(residual_norm, 1e-8)
-    debiased = (residual / residual_norm).astype(np.float32)
-    if np.any(fallback_mask):
-        debiased[fallback_mask] = features_norm[fallback_mask]
-    return debiased
 
 
-def _pca_subspace_debiased_features(
-    features_norm: np.ndarray,
-    mean_reference_vectors: np.ndarray,
-    pca_basis: np.ndarray,
-) -> np.ndarray:
-    if features_norm.shape != mean_reference_vectors.shape:
-        raise ValueError(
-            f"Feature/reference shape mismatch: {features_norm.shape} vs {mean_reference_vectors.shape}"
-        )
-    if features_norm.shape[0] != pca_basis.shape[0] or features_norm.shape[1] != pca_basis.shape[2]:
-        raise ValueError(
-            f"Feature/PCA basis shape mismatch: {features_norm.shape} vs {pca_basis.shape}"
-        )
-
-    projection_mean = np.sum(features_norm * mean_reference_vectors, axis=1, keepdims=True)
-    residual = features_norm - projection_mean * mean_reference_vectors
-    coeff = np.einsum("pd,pkd->pk", residual, pca_basis, optimize=True)
-    residual = residual - np.einsum("pk,pkd->pd", coeff, pca_basis, optimize=True)
-    residual_norm = np.linalg.norm(residual, axis=1, keepdims=True)
-    fallback_mask = residual_norm.squeeze(-1) <= 1e-8
-    residual_norm = np.maximum(residual_norm, 1e-8)
-    debiased = (residual / residual_norm).astype(np.float32)
-    if np.any(fallback_mask):
-        debiased[fallback_mask] = features_norm[fallback_mask]
-    return debiased
 
 
-def _apply_feature_mode(
-    features_norm: np.ndarray,
-    feature_mode: str,
-    reference_vectors: np.ndarray | None = None,
-    pca_basis: np.ndarray | None = None,
-) -> np.ndarray:
-    if feature_mode == "raw":
-        return features_norm
-    if feature_mode == "debiased":
-        if reference_vectors is None:
-            raise ValueError("reference_vectors fehlen fuer debiased mode")
-        return _debiased_features(features_norm, reference_vectors)
-    if feature_mode.startswith("pca_subspace_k"):
-        if reference_vectors is None or pca_basis is None:
-            raise ValueError(f"reference_vectors oder pca_basis fehlen fuer {feature_mode}")
-        return _pca_subspace_debiased_features(features_norm, reference_vectors, pca_basis)
-    raise ValueError(f"Unsupported feature_mode: {feature_mode}")
 
 
-def _apply_irelief_reweight(
-    features_norm: np.ndarray,
-    scale_sqrt_weights: np.ndarray,
-) -> np.ndarray:
-    if features_norm.shape[1] != scale_sqrt_weights.shape[0]:
-        raise ValueError(
-            f"I-Relief scale dimension mismatch: features={features_norm.shape} vs scale={scale_sqrt_weights.shape}"
-        )
-    weighted = features_norm * scale_sqrt_weights[None, :]
-    norms = np.linalg.norm(weighted, axis=1, keepdims=True)
-    fallback_mask = norms.squeeze(-1) <= 1e-8
-    norms = np.maximum(norms, 1e-8)
-    weighted = (weighted / norms).astype(np.float32)
-    if np.any(fallback_mask):
-        weighted[fallback_mask] = features_norm[fallback_mask]
-    return weighted
 
 
-def _apply_feature_subset(
-    features_norm: np.ndarray,
-    feature_indices: np.ndarray,
-    renormalize: bool = True,
-) -> np.ndarray:
-    if feature_indices.ndim != 1:
-        raise ValueError(f"feature_indices muessen 1D sein, erhalten: {feature_indices.shape}")
-    if feature_indices.size <= 0:
-        raise ValueError("feature_indices duerfen nicht leer sein")
-    if int(np.min(feature_indices)) < 0 or int(np.max(feature_indices)) >= features_norm.shape[1]:
-        raise ValueError(
-            f"Feature-Subset ausserhalb des gueltigen Bereichs: "
-            f"features={features_norm.shape}, min={int(np.min(feature_indices))}, max={int(np.max(feature_indices))}"
-        )
-    reduced = features_norm[:, feature_indices].astype(np.float32)
-    if not renormalize:
-        return reduced
-    norms = np.linalg.norm(reduced, axis=1, keepdims=True)
-    fallback_mask = norms.squeeze(-1) <= 1e-8
-    norms = np.maximum(norms, 1e-8)
-    reduced = (reduced / norms).astype(np.float32)
-    if np.any(fallback_mask):
-        reduced[fallback_mask] = 0.0
-    return reduced
 
 
-def _similarity_grid_from_query(
-    query_feature: np.ndarray,
-    target_features_norm: np.ndarray,
-    target_grid_shape: tuple[int, int],
-) -> np.ndarray:
-    sims = target_features_norm @ query_feature
-    return sims.reshape(target_grid_shape).astype(np.float32)
 
 
-def _top_matches(
-    sim_grid: np.ndarray,
-    top_k: int,
-    exclude_patches: list[tuple[int, int]] | None = None,
-    valid_mask: np.ndarray | None = None,
-) -> list[tuple[int, int, float]]:
-    rows, cols = sim_grid.shape
-    flat = sim_grid.reshape(-1).astype(np.float32)
-    exclude_indices: set[int] = set()
-    if exclude_patches:
-        exclude_indices = {row * cols + col for row, col in exclude_patches}
-    if valid_mask is not None:
-        valid_flat = valid_mask.reshape(-1).astype(bool)
-        flat = flat.copy()
-        flat[~valid_flat] = -np.inf
-    order = np.argsort(-flat)
-    matches: list[tuple[int, int, float]] = []
-    for idx in order:
-        if not np.isfinite(flat[int(idx)]):
-            continue
-        if int(idx) in exclude_indices:
-            continue
-        row = int(idx // cols)
-        col = int(idx % cols)
-        matches.append((row, col, float(flat[idx])))
-        if len(matches) >= top_k:
-            break
-    return matches
 
 
 def _run_component_test_for_sample(
@@ -3789,7 +3155,7 @@ def render_test_dataset_mode(experiment_dir_str: str, seed: int) -> None:
 
         classifier_choice = st.selectbox(
             "ROI-Klassifikator",
-            options=["Boruta", "mRMR"],
+            options=["Boruta", "BorutaExtraTrees", "mRMR"],
             index=0,
             key="test_dataset_classifier_choice",
             format_func=_format_component_classifier_choice,
@@ -4024,6 +3390,8 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
     selected_roi_logic_key = DEFAULT_COMPONENT_TEST_ROI_LOGIC_KEY
     classifier_choice = "Boruta"
     uploaded_files = []
+    albedo_uploaded_files = []
+    overlay_on_albedo = False
     live_config: dict[str, Any] | None = None
     if source_mode == "Externe Uploads":
         try:
@@ -4035,6 +3403,18 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
         except Exception as exc:
             st.error(f"Live-Inferenz konnte nicht vorbereitet werden: {exc}")
             return
+
+    classifier_options = ["Boruta", "BorutaExtraTrees", "mRMR"]
+    if source_mode == "Externe Uploads":
+        classifier_options.append("BorutaAlbedoFusion")
+    classifier_choice = st.selectbox(
+        "ROI-Klassifikator",
+        options=classifier_options,
+        index=0,
+        key="component_test_classifier_choice",
+        format_func=_format_component_classifier_choice,
+    )
+    uses_albedo_fusion = classifier_choice == "BorutaAlbedoFusion"
 
     with st.form("component_test_form"):
         config_col, option_col = st.columns([1.2, 1.0])
@@ -4064,11 +3444,22 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         key="component_test_external_object",
                     )
                     uploaded_files = st.file_uploader(
-                        "Externe Bilder hochladen",
+                        "Normalmap-Bilder hochladen" if uses_albedo_fusion else "Externe Bilder hochladen",
                         type=COMPONENT_TEST_UPLOAD_EXTENSIONS,
                         accept_multiple_files=True,
                         key="component_test_uploads",
                     )
+                    if uses_albedo_fusion:
+                        albedo_uploaded_files = st.file_uploader(
+                            "Passende Albedobilder hochladen",
+                            type=COMPONENT_TEST_UPLOAD_EXTENSIONS,
+                            accept_multiple_files=True,
+                            key="component_test_albedo_uploads",
+                        )
+                        st.caption(
+                            "Normalmap und Albedo werden ueber den identischen Dateinamen gepaart. "
+                            "Beide Bilder muessen geometrisch deckungsgleich sein."
+                        )
                     confirmed_config = load_anomaly_detection_confirmed_config(experiment_dir_str, selected_object_name)
                     if confirmed_config is not None:
                         try:
@@ -4093,15 +3484,23 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         f"Threshold={object_threshold:.6f} | Referenzbilder={ref_count} | Quelle={source_label}"
                     )
         with option_col:
-            classifier_choice = st.selectbox(
-                "ROI-Klassifikator",
-                options=["Boruta", "mRMR"],
-                index=0,
-                key="component_test_classifier_choice",
-                format_func=_format_component_classifier_choice,
-            )
-            st.caption("Beide Optionen nutzen RBF-SVMs mit derselben min/max/mean-ROI-Featurelogik.")
+            if uses_albedo_fusion:
+                st.caption(
+                    "Die ROI-Positionen stammen aus der Normalmap. Der Klassifikator kombiniert "
+                    "Normalmap- und Albedo-Merkmale derselben Patches."
+                )
+            else:
+                st.caption(
+                    "Alle Optionen nutzen dieselbe min/max/mean-ROI-Featurelogik; "
+                    "nur Featureauswahl und Klassifikator unterscheiden sich."
+                )
             render_overlays = st.checkbox("Overlays rendern", value=False, key="component_test_render_overlays")
+            if uses_albedo_fusion:
+                overlay_on_albedo = st.checkbox(
+                    "auf Albedo zeichnen",
+                    value=False,
+                    key="component_test_overlay_on_albedo",
+                )
             if source_mode == "Run-Bilder":
                 st.caption("Wenn aktiv, werden pro Bild ROI-Boxen mit 2D/3D-Labels direkt in der App gerendert.")
             else:
@@ -4154,6 +3553,37 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
             if not uploaded_files:
                 st.warning("Lade mindestens ein Bild hoch.")
                 return
+            albedo_upload_by_name: dict[str, Any] = {}
+            if uses_albedo_fusion:
+                if not albedo_uploaded_files:
+                    st.warning("Lade fuer das Fusionsmodell die passenden Albedobilder hoch.")
+                    return
+                normal_names = [Path(str(file.name)).name.casefold() for file in uploaded_files]
+                albedo_names = [Path(str(file.name)).name.casefold() for file in albedo_uploaded_files]
+                duplicate_normal_names = sorted(
+                    {name for name in normal_names if normal_names.count(name) > 1}
+                )
+                duplicate_albedo_names = sorted(
+                    {name for name in albedo_names if albedo_names.count(name) > 1}
+                )
+                if duplicate_normal_names or duplicate_albedo_names:
+                    st.error(
+                        "Doppelte Dateinamen verhindern eine eindeutige Paarbildung. "
+                        f"Normalmap={duplicate_normal_names}, Albedo={duplicate_albedo_names}"
+                    )
+                    return
+                albedo_upload_by_name = {
+                    Path(str(file.name)).name.casefold(): file for file in albedo_uploaded_files
+                }
+                missing_albedo_names = sorted(set(normal_names) - set(albedo_names))
+                unmatched_albedo_names = sorted(set(albedo_names) - set(normal_names))
+                if missing_albedo_names or unmatched_albedo_names:
+                    st.error(
+                        "Normalmap- und Albedo-Uploads bilden keine vollstaendigen Paare. "
+                        f"Fehlende Albedobilder={missing_albedo_names}; "
+                        f"Albedobilder ohne Normalmap={unmatched_albedo_names}"
+                    )
+                    return
             try:
                 experiment_dir = Path(experiment_dir_str).resolve()
                 load_component_test_backbone(experiment_dir_str)
@@ -4190,6 +3620,15 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                 try:
                     image = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
                     image_rgb = np.asarray(image, dtype=np.uint8)
+                    albedo_image_rgb = None
+                    if uses_albedo_fusion:
+                        upload_name = Path(str(uploaded_file.name)).name.casefold()
+                        albedo_uploaded_file = albedo_upload_by_name[upload_name]
+                        with Image.open(io.BytesIO(albedo_uploaded_file.getvalue())) as albedo_image:
+                            albedo_image_rgb = np.asarray(
+                                albedo_image.convert("L").convert("RGB"),
+                                dtype=np.uint8,
+                            )
                     result = _run_component_test_for_external_image(
                         experiment_dir_str=experiment_dir_str,
                         seed=int(seed),
@@ -4199,6 +3638,8 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         classifier_info=classifier_info,
                         render_overlays=bool(render_overlays),
                         roi_logic_key=str(selected_roi_logic_key),
+                        albedo_image_rgb=albedo_image_rgb,
+                        overlay_on_albedo=bool(overlay_on_albedo),
                     )
                 except Exception as exc:
                     result = {
@@ -4217,6 +3658,7 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
                         "note": f"Fehler in frischer Inferenz: {exc}",
                         "roi_predictions": [],
                         "overlay_rgb": None,
+                        "overlay_modality": "albedo" if overlay_on_albedo else "normalmap",
                         "roi_extraction_logic": str(selected_roi_logic_key),
                     }
                 results.append(result)
@@ -4227,6 +3669,7 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
             "results": results,
             "render_overlays": bool(render_overlays),
             "classifier_choice": str(classifier_choice),
+            "overlay_on_albedo": bool(overlay_on_albedo),
         }
 
     stored = st.session_state.get(COMPONENT_TEST_VIEW_KEY)
@@ -4241,6 +3684,7 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
             "sample": row["sample"],
             "group": row["evaluation_group"],
             "classifier": stored_classifier_choice,
+            "overlay_modality": row.get("overlay_modality", "normalmap"),
             "roi_extraction_logic": row.get("roi_extraction_logic", ""),
             "image_score": row["image_score"],
             "image_threshold": row["image_threshold"],
@@ -4259,6 +3703,99 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
 
     st.subheader("Bauteil-Ergebnisse")
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    overlay_count = sum(1 for row in results if row.get("overlay_rgb") is not None)
+    if overlay_count:
+        st.download_button(
+            f"Alle ROI-Overlays als ZIP speichern ({overlay_count})",
+            data=_component_test_overlays_to_zip_bytes(results),
+            file_name=f"component_test_overlays_{_safe_name(stored_classifier_choice.lower())}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    elif render_overlays:
+        st.info("Es wurden keine Overlaybilder erzeugt, die gespeichert werden koennten.")
+
+    st.subheader("ROI-Klassifikator-Testauswertung")
+    st.caption(
+        "Optionaler Workflow fuer einen separaten ROI-Testdatensatz. "
+        "Exportiere zuerst die ROI-Vorhersagen, trage in Excel `true_roi_label` ein "
+        "und lade die ausgefuellte Tabelle danach wieder hoch."
+    )
+    label_table = _build_roi_classifier_label_table(results)
+    if label_table.empty:
+        st.info("Fuer den aktuellen Lauf gibt es keine ROIs. Es kann keine ROI-Testtabelle exportiert werden.")
+    else:
+        export_col, upload_col = st.columns([0.9, 1.1])
+        with export_col:
+            st.metric("Exportierbare ROIs", str(len(label_table)))
+            st.download_button(
+                "ROI-Testtabelle als Excel herunterladen",
+                data=_dataframe_to_xlsx_bytes(label_table),
+                file_name=f"roi_classifier_test_labels_{_safe_name(stored_classifier_choice.lower())}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            st.download_button(
+                "ROI-Testtabelle als CSV herunterladen",
+                data=label_table.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"roi_classifier_test_labels_{_safe_name(stored_classifier_choice.lower())}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with upload_col:
+            uploaded_label_table = st.file_uploader(
+                "Gelabelte ROI-Testtabelle hochladen",
+                type=["xlsx", "xls", "csv"],
+                key="roi_classifier_eval_label_table_upload",
+            )
+            if st.button("Metriken berechnen", use_container_width=True, disabled=uploaded_label_table is None):
+                try:
+                    uploaded_table = _read_uploaded_label_table(uploaded_label_table)
+                    evaluation = _evaluate_roi_classifier_label_table(uploaded_table)
+                except Exception as exc:
+                    st.error(f"ROI-Testtabelle konnte nicht ausgewertet werden: {exc}")
+                else:
+                    roi_metrics = evaluation["roi_metrics"]
+                    part_metrics = evaluation["part_metrics"]
+                    st.success(
+                        f"Auswertung abgeschlossen: {len(evaluation['roi_table'])} ROIs, "
+                        f"{len(evaluation['part_table'])} Bauteile/Bilder."
+                    )
+
+                    st.markdown("**ROI-Ebene**")
+                    roi_cols = st.columns(5)
+                    roi_cols[0].metric("Accuracy", f"{roi_metrics['accuracy']:.3f}")
+                    roi_cols[1].metric("Macro-F1", f"{roi_metrics['macro_f1']:.3f}")
+                    roi_cols[2].metric("Macro-Recall", f"{roi_metrics['macro_recall']:.3f}")
+                    roi_cols[3].metric("3D-Recall", f"{roi_metrics['per_class']['3D']['recall']:.3f}")
+                    roi_cols[4].metric("3D-F1", f"{roi_metrics['per_class']['3D']['f1']:.3f}")
+                    st.dataframe(_confusion_matrix_dataframe(roi_metrics), use_container_width=True)
+
+                    st.markdown("**Bauteilebene**")
+                    part_cols = st.columns(5)
+                    part_cols[0].metric("Accuracy", f"{part_metrics['accuracy']:.3f}")
+                    part_cols[1].metric("Macro-F1", f"{part_metrics['macro_f1']:.3f}")
+                    part_cols[2].metric("Macro-Recall", f"{part_metrics['macro_recall']:.3f}")
+                    part_cols[3].metric("3D-Recall", f"{part_metrics['per_class']['3D']['recall']:.3f}")
+                    part_cols[4].metric("3D-F1", f"{part_metrics['per_class']['3D']['f1']:.3f}")
+                    st.dataframe(_confusion_matrix_dataframe(part_metrics), use_container_width=True)
+
+                    with st.expander("Aggregierte Bauteilentscheidungen", expanded=False):
+                        st.dataframe(evaluation["part_table"], use_container_width=True, hide_index=True)
+                    metrics_payload = {
+                        "classifier": stored_classifier_choice,
+                        "num_roi_rows": int(len(evaluation["roi_table"])),
+                        "num_parts": int(len(evaluation["part_table"])),
+                        "roi_metrics": roi_metrics,
+                        "part_metrics": part_metrics,
+                    }
+                    st.download_button(
+                        "Metriken als JSON herunterladen",
+                        data=json.dumps(metrics_payload, indent=2, ensure_ascii=False).encode("utf-8"),
+                        file_name=f"roi_classifier_metrics_{_safe_name(stored_classifier_choice.lower())}.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
 
     for result in results:
         label = f"{result['sample']} -> {result['part_label']}"
@@ -4284,12 +3821,8 @@ def render_component_test_mode(context: dict[str, Any], experiment_dir_str: str,
 
 
 def main() -> None:
-    st.set_page_config(page_title="AnomalyDINO Similarity Explorer", layout="wide")
-    st.title("AnomalyDINO Similarity Explorer")
-    st.caption(
-        "Analysewerkzeug zur visuellen Untersuchung von Patch-Aehnlichkeiten. "
-        "Dieses Werkzeug ist vom finalen Bauteil-Test getrennt."
-    )
+    st.set_page_config(page_title="AnomalyDINO Explorer", layout="wide")
+    st.title("AnomalyDINO Explorer")
 
     default_experiment_dir = _parse_experiment_dir_from_argv()
     experiment_dir_str = st.sidebar.text_input("Experiment Directory", value=default_experiment_dir)
@@ -4308,730 +3841,23 @@ def main() -> None:
         }
         st.warning(
             "Der vollstaendige Run-Kontext konnte nicht geladen werden. "
-            "Der Similarity Explorer benoetigt die separat bereitgestellten Feature- und Anomaly-Map-Caches. "
+            "Cache-abhaengige Ansichten wie `Bauteil-Test` fuer vorhandene Run-Bilder "
+            "benoetigen die separat bereitgestellten Feature- und Anomaly-Map-Caches. "
             f"Details: {exc}"
         )
 
-    if context_load_error is not None:
-        st.info(
-            "`Similarity Explorer` ist in diesem reduzierten GitHub-Stand erst nutzbar, "
-            "wenn die externen Feature-Caches und Anomaly-Maps in den Experimentordner gelegt wurden."
-        )
+    view_mode = st.radio(
+        "Ansicht",
+        options=["Bauteil-Test", "Einstellungen"],
+        index=1 if context_load_error is not None else 0,
+        horizontal=True,
+    )
+    if view_mode == "Bauteil-Test":
+        render_component_test_mode(context, experiment_dir_str, int(seed))
         return
-
-    sample_rows = context["samples"]
-    groups = ["all"] + sorted({row["evaluation_group"] for row in sample_rows})
-
-    query_group = st.sidebar.selectbox("Query Group", groups, index=0)
-    if query_group == "all":
-        query_rows = sample_rows
-    else:
-        query_rows = [row for row in sample_rows if row["evaluation_group"] == query_group]
-    query_samples = [row["sample"] for row in query_rows]
-    if not query_samples:
-        st.warning("Keine Query-Samples fuer den gewaehlten Filter gefunden.")
+    if view_mode == "Einstellungen":
+        render_settings_mode(context, experiment_dir_str, int(seed))
         return
-
-    query_sample = st.sidebar.selectbox("Query Sample", query_samples, index=0)
-    target_equals_query = st.sidebar.checkbox("Target = Query", value=True)
-
-    if target_equals_query:
-        target_sample = query_sample
-    else:
-        target_group = st.sidebar.selectbox("Target Group", groups, index=0)
-        if target_group == "all":
-            target_rows = sample_rows
-        else:
-            target_rows = [row for row in sample_rows if row["evaluation_group"] == target_group]
-        target_samples = [row["sample"] for row in target_rows]
-        if not target_samples:
-            st.warning("Keine Target-Samples fuer den gewaehlten Filter gefunden.")
-            return
-        default_target_index = target_samples.index(query_sample) if query_sample in target_samples else 0
-        target_sample = st.sidebar.selectbox("Target Sample", target_samples, index=default_target_index)
-
-    top_k = int(st.sidebar.slider("Top aehnliche Patches", min_value=1, max_value=12, value=6))
-    feature_source_mode = "normal"
-    st.sidebar.caption("Feature Source: Normalmap DINOv3")
-    fusion_alpha_normal = 1.0
-    fusion_alpha_albedo = 0.0
-    show_anomaly_overlay = st.sidebar.checkbox("Target Anomaly-Map anzeigen", value=True)
-    show_top_match_boxes = st.sidebar.checkbox("Top-Matches im Similarity-Overlay markieren", value=True)
-    anomalous_only_target = st.sidebar.checkbox(
-        "Nur target patches ueber Bildthreshold vergleichen",
-        value=False,
-    )
-    positions_debiased = st.sidebar.checkbox(
-        "Positionsbias mit good-reference entfernen",
-        value=False,
-    )
-    pca_subspace_k = int(st.sidebar.selectbox(
-        "PCA-Subspace-Debias",
-        options=[0, 2, 3],
-        format_func=lambda value: {
-            0: "aus",
-            2: "k=2",
-            3: "k=3",
-        }[value],
-        index=0,
-    ))
-    pca_subspace_debiased = pca_subspace_k > 0
-    use_irelief_patch_reweight = st.sidebar.checkbox(
-        "I-Relief-Reweight auf Normalmap anwenden",
-        value=False,
-    )
-    use_multilayer_irelief_normal = st.sidebar.checkbox(
-        "Multi-Layer (Layer 1-12) + I-Relief auf Normalmap verwenden",
-        value=False,
-    )
-    use_top10pct_classifier_top32 = st.sidebar.checkbox(
-        "Top10%-Klassifikator: nur die 32 I-Relief-Features auf Normalmap verwenden",
-        value=False,
-    )
-    evaluate_top10pct_classifier = st.sidebar.checkbox(
-        "Top1-Patch-Klassifikator auf Query-Patches auswerten",
-        value=False,
-    )
-    if use_top10pct_classifier_top32:
-        use_multilayer_irelief_normal = True
-    if pca_subspace_debiased:
-        positions_debiased = False
-
-    try:
-        query_assets = load_sample_assets(experiment_dir_str, int(seed), query_sample)
-        target_assets = query_assets if target_sample == query_sample else load_sample_assets(
-            experiment_dir_str,
-            int(seed),
-            target_sample,
-        )
-    except Exception as exc:
-        st.error(f"Sample konnte nicht geladen werden: {exc}")
-        return
-
-    query_albedo_assets = None
-    target_albedo_assets = None
-    if feature_source_mode != "normal":
-        try:
-            query_albedo_assets = load_albedo_sample_assets(experiment_dir_str, int(seed), query_sample)
-            target_albedo_assets = (
-                query_albedo_assets
-                if target_sample == query_sample
-                else load_albedo_sample_assets(experiment_dir_str, int(seed), target_sample)
-            )
-        except Exception as exc:
-            st.error(f"Albedo-Sample konnte nicht geladen werden: {exc}")
-            return
-        if tuple(query_albedo_assets["grid_shape"]) != tuple(query_assets["grid_shape"]):
-            st.error(
-                f"Grid-Mismatch Query normal/albedo: {query_assets['grid_shape']} vs {query_albedo_assets['grid_shape']}"
-            )
-            return
-        if tuple(target_albedo_assets["grid_shape"]) != tuple(target_assets["grid_shape"]):
-            st.error(
-                f"Grid-Mismatch Target normal/albedo: {target_assets['grid_shape']} vs {target_albedo_assets['grid_shape']}"
-            )
-            return
-
-    query_multilayer_assets = None
-    target_multilayer_assets = None
-    need_multilayer_query = (
-        (use_multilayer_irelief_normal and feature_source_mode in ("normal", "fused"))
-        or use_top10pct_classifier_top32
-        or evaluate_top10pct_classifier
-    )
-    if need_multilayer_query:
-        try:
-            query_multilayer_assets = load_multilayer_sample_assets(experiment_dir_str, int(seed), query_sample)
-            target_multilayer_assets = (
-                query_multilayer_assets
-                if target_sample == query_sample
-                else load_multilayer_sample_assets(experiment_dir_str, int(seed), target_sample)
-            )
-        except Exception as exc:
-            st.error(f"Multi-Layer-Normalmap-Sample konnte nicht geladen werden: {exc}")
-            return
-        if tuple(query_multilayer_assets["grid_shape"]) != tuple(query_assets["grid_shape"]):
-            st.error(
-                "Grid-Mismatch Query normal/multilayer: "
-                f"{query_assets['grid_shape']} vs {query_multilayer_assets['grid_shape']}"
-            )
-            return
-        if tuple(target_multilayer_assets["grid_shape"]) != tuple(target_assets["grid_shape"]):
-            st.error(
-                "Grid-Mismatch Target normal/multilayer: "
-                f"{target_assets['grid_shape']} vs {target_multilayer_assets['grid_shape']}"
-            )
-            return
-
-    normal_reference_info = None
-    normal_pca_reference_info = None
-    albedo_reference_info = None
-    albedo_pca_reference_info = None
-    irelief_info = None
-    irelief_scale_sqrt = None
-    multilayer_irelief_info = None
-    multilayer_irelief_scale_sqrt = None
-    top10pct_classifier_feature_info = None
-    top10pct_classifier_feature_indices = None
-    top10pct_classifier_model_info = None
-    feature_mode = "raw"
-    normal_feature_mode = feature_mode
-    if pca_subspace_debiased:
-        feature_mode = f"pca_subspace_k{pca_subspace_k}"
-        if feature_source_mode in ("normal", "fused"):
-            if use_multilayer_irelief_normal:
-                normal_feature_mode = "raw"
-            else:
-                normal_feature_mode = feature_mode
-                try:
-                    normal_pca_reference_info = load_positional_pca_reference(
-                        experiment_dir_str,
-                        int(seed),
-                        num_components=pca_subspace_k,
-                        num_power_iterations=3,
-                    )
-                except Exception as exc:
-                    st.error(f"Normalmap-PCA-Subspace-Referenz konnte nicht geladen werden: {exc}")
-                    return
-                normal_reference_info = normal_pca_reference_info["mean_reference"]
-        if feature_source_mode in ("albedo", "fused"):
-            try:
-                albedo_pca_reference_info = load_albedo_positional_pca_reference(
-                    experiment_dir_str,
-                    int(seed),
-                    num_components=pca_subspace_k,
-                    num_power_iterations=3,
-                )
-            except Exception as exc:
-                st.error(f"Albedo-PCA-Subspace-Referenz konnte nicht geladen werden: {exc}")
-                return
-            albedo_reference_info = albedo_pca_reference_info["mean_reference"]
-    elif positions_debiased:
-        feature_mode = "debiased"
-        if feature_source_mode in ("normal", "fused"):
-            if use_multilayer_irelief_normal:
-                normal_feature_mode = "raw"
-            else:
-                normal_feature_mode = feature_mode
-                try:
-                    normal_reference_info = load_positional_reference(experiment_dir_str, int(seed))
-                except Exception as exc:
-                    st.error(f"Normalmap-Positionsreferenz konnte nicht geladen werden: {exc}")
-                    return
-        if feature_source_mode in ("albedo", "fused"):
-            try:
-                albedo_reference_info = load_albedo_positional_reference(experiment_dir_str, int(seed))
-            except Exception as exc:
-                st.error(f"Albedo-Positionsreferenz konnte nicht geladen werden: {exc}")
-                return
-    else:
-        normal_feature_mode = "raw"
-
-    use_irelief_patch_reweight_effective = use_irelief_patch_reweight and not use_multilayer_irelief_normal
-    if use_irelief_patch_reweight_effective:
-        try:
-            irelief_info = load_irelief_scale_weights(experiment_dir_str)
-            irelief_scale_sqrt = np.asarray(irelief_info["scale_sqrt"], dtype=np.float32)
-        except Exception as exc:
-            st.error(f"I-Relief-Gewichtung konnte nicht geladen werden: {exc}")
-            return
-    if use_multilayer_irelief_normal and feature_source_mode in ("normal", "fused"):
-        try:
-            multilayer_irelief_info = load_multilayer_irelief_scale_weights(experiment_dir_str)
-            multilayer_irelief_scale_sqrt = np.asarray(multilayer_irelief_info["scale_sqrt"], dtype=np.float32)
-        except Exception as exc:
-            st.error(f"Multi-Layer-I-Relief-Gewichtung konnte nicht geladen werden: {exc}")
-            return
-    if use_top10pct_classifier_top32 and feature_source_mode in ("normal", "fused"):
-        try:
-            top10pct_classifier_feature_info = load_top10pct_classifier_feature_selection(experiment_dir_str)
-            top10pct_classifier_feature_indices = np.asarray(
-                top10pct_classifier_feature_info["feature_indices"],
-                dtype=np.int32,
-            )
-        except Exception as exc:
-            st.error(f"Top10%-Klassifikator-Featureauswahl konnte nicht geladen werden: {exc}")
-            return
-    if evaluate_top10pct_classifier:
-        try:
-            classifier_dir = Path(experiment_dir_str).resolve() / TOP1PATCH_CLASSIFIER_FEATURE_SUBDIR
-            top1patch_cache_signature = _classifier_file_signature(
-                classifier_dir / "selected_topk_features.csv",
-                classifier_dir / "classifier_pipeline.joblib",
-                classifier_dir / "irelief_feature_scale_sqrt.npy",
-                classifier_dir / "summary.json",
-                classifier_dir / "model_info.json",
-            )
-            top10pct_classifier_model_info = load_top1patch_classifier_model(
-                experiment_dir_str,
-                int(seed),
-                top1patch_cache_signature,
-            )
-        except Exception as exc:
-            st.error(f"Top1-Patch-Klassifikator konnte nicht geladen werden: {exc}")
-            return
-
-    feature_mode_display = feature_mode
-    normal_mode_bits: list[str] = []
-    if use_multilayer_irelief_normal:
-        normal_mode_bits.append("multilayer_l1to12_irelief")
-    if use_top10pct_classifier_top32:
-        normal_mode_bits.append("top10pct_classifier_top32")
-    normal_mode_display = "raw"
-    if normal_mode_bits:
-        normal_mode_display = "raw + " + " + ".join(normal_mode_bits)
-    if use_multilayer_irelief_normal and feature_source_mode == "normal":
-        feature_mode_display = normal_mode_display
-    elif use_multilayer_irelief_normal and feature_source_mode == "fused":
-        feature_mode_display = f"normal:{normal_mode_display} | albedo:{feature_mode}"
-    elif use_irelief_patch_reweight_effective and feature_source_mode in ("normal", "fused"):
-        feature_mode_display = f"{feature_mode_display} + irelief_patch_reweight"
-
-    normal_reference_vectors = None
-    normal_pca_basis = None
-    if normal_reference_info is not None:
-        normal_reference_vectors = np.asarray(normal_reference_info["reference_vectors"], dtype=np.float32)
-    if normal_pca_reference_info is not None:
-        normal_pca_basis = np.asarray(normal_pca_reference_info["basis"], dtype=np.float32)
-
-    albedo_reference_vectors = None
-    albedo_pca_basis = None
-    if albedo_reference_info is not None:
-        albedo_reference_vectors = np.asarray(albedo_reference_info["reference_vectors"], dtype=np.float32)
-    if albedo_pca_reference_info is not None:
-        albedo_pca_basis = np.asarray(albedo_pca_reference_info["basis"], dtype=np.float32)
-
-    query_normal_features_for_similarity = None
-    target_normal_features_for_similarity = None
-    if feature_source_mode in ("normal", "fused"):
-        query_normal_source_features = (
-            query_multilayer_assets["features_norm"]
-            if use_multilayer_irelief_normal
-            else query_assets["features_norm"]
-        )
-        target_normal_source_features = (
-            query_normal_source_features
-            if target_sample == query_sample
-            else (
-                target_multilayer_assets["features_norm"]
-                if use_multilayer_irelief_normal
-                else target_assets["features_norm"]
-            )
-        )
-        query_normal_features_for_similarity = _apply_feature_mode(
-            query_normal_source_features,
-            feature_mode=normal_feature_mode,
-            reference_vectors=normal_reference_vectors,
-            pca_basis=normal_pca_basis,
-        )
-        if use_multilayer_irelief_normal:
-            assert multilayer_irelief_scale_sqrt is not None
-            query_normal_features_for_similarity = _apply_irelief_reweight(
-                query_normal_features_for_similarity,
-                multilayer_irelief_scale_sqrt,
-            )
-            if use_top10pct_classifier_top32:
-                assert top10pct_classifier_feature_indices is not None
-                query_normal_features_for_similarity = _apply_feature_subset(
-                    query_normal_features_for_similarity,
-                    top10pct_classifier_feature_indices,
-                )
-        elif use_irelief_patch_reweight_effective:
-            assert irelief_scale_sqrt is not None
-            query_normal_features_for_similarity = _apply_irelief_reweight(
-                query_normal_features_for_similarity,
-                irelief_scale_sqrt,
-            )
-        target_normal_features_for_similarity = (
-            query_normal_features_for_similarity
-            if target_sample == query_sample
-            else _apply_feature_mode(
-                target_normal_source_features,
-                feature_mode=normal_feature_mode,
-                reference_vectors=normal_reference_vectors,
-                pca_basis=normal_pca_basis,
-            )
-        )
-        if target_sample != query_sample:
-            if use_multilayer_irelief_normal:
-                assert multilayer_irelief_scale_sqrt is not None
-                target_normal_features_for_similarity = _apply_irelief_reweight(
-                    target_normal_features_for_similarity,
-                    multilayer_irelief_scale_sqrt,
-                )
-                if use_top10pct_classifier_top32:
-                    assert top10pct_classifier_feature_indices is not None
-                    target_normal_features_for_similarity = _apply_feature_subset(
-                        target_normal_features_for_similarity,
-                        top10pct_classifier_feature_indices,
-                    )
-            elif use_irelief_patch_reweight_effective:
-                assert irelief_scale_sqrt is not None
-                target_normal_features_for_similarity = _apply_irelief_reweight(
-                    target_normal_features_for_similarity,
-                    irelief_scale_sqrt,
-                )
-
-    query_albedo_features_for_similarity = None
-    target_albedo_features_for_similarity = None
-    if feature_source_mode in ("albedo", "fused"):
-        assert query_albedo_assets is not None and target_albedo_assets is not None
-        query_albedo_features_for_similarity = _apply_feature_mode(
-            query_albedo_assets["features_norm"],
-            feature_mode=feature_mode,
-            reference_vectors=albedo_reference_vectors,
-            pca_basis=albedo_pca_basis,
-        )
-        target_albedo_features_for_similarity = (
-            query_albedo_features_for_similarity
-            if target_sample == query_sample
-            else _apply_feature_mode(
-                target_albedo_assets["features_norm"],
-                feature_mode=feature_mode,
-                reference_vectors=albedo_reference_vectors,
-                pca_basis=albedo_pca_basis,
-            )
-        )
-
-    query_state_key = f"query_patches::{query_sample}"
-    if query_state_key not in st.session_state:
-        st.session_state[query_state_key] = []
-
-    left, right = st.columns([1.1, 1.1])
-
-    with left:
-        st.subheader(f"Query: {query_sample}")
-        st.caption(
-            f"group={query_assets['evaluation_group']} | grid={query_assets['grid_shape'][0]}x{query_assets['grid_shape'][1]} | "
-            f"image_score={query_assets['image_score']:.5f} | threshold={query_assets['image_threshold']:.5f}"
-        )
-        source_caption = f"feature_source={feature_source_mode} | feature_mode={feature_mode_display}"
-        if feature_source_mode == "fused":
-            source_caption += f" | normal_w={fusion_alpha_normal:.2f} | albedo_w={fusion_alpha_albedo:.2f}"
-        st.caption(source_caption)
-        reference_bits: list[str] = []
-        if use_multilayer_irelief_normal and feature_source_mode in ("normal", "fused") and query_multilayer_assets is not None:
-            reference_bits.append(f"multilayer_layers={query_multilayer_assets['num_layers']}")
-            reference_bits.append(f"multilayer_dim={query_multilayer_assets['feature_dim']}")
-        if feature_source_mode in ("normal", "fused") and normal_reference_info is not None:
-            reference_bits.append(f"normal_ref_images={normal_reference_info['num_good_images']}")
-            reference_bits.append(f"normal_valid_ref_mean={normal_reference_info['count_valid_mean']:.1f}")
-        if feature_source_mode in ("albedo", "fused") and albedo_reference_info is not None:
-            reference_bits.append(f"albedo_ref_images={albedo_reference_info['num_good_images']}")
-            reference_bits.append(f"albedo_valid_ref_mean={albedo_reference_info['count_valid_mean']:.1f}")
-        if use_multilayer_irelief_normal and feature_source_mode in ("normal", "fused") and multilayer_irelief_info is not None:
-            reference_bits.append(f"multilayer_irelief_dim={multilayer_irelief_info['feature_dim']}")
-        if use_top10pct_classifier_top32 and feature_source_mode in ("normal", "fused") and top10pct_classifier_feature_info is not None:
-            reference_bits.append(
-                f"top10pct_classifier_features={top10pct_classifier_feature_info['num_selected_features']}"
-            )
-        if evaluate_top10pct_classifier and top10pct_classifier_model_info is not None:
-            reference_bits.append(f"top1patch_classifier_k={top10pct_classifier_model_info['fixed_k']}")
-        elif use_irelief_patch_reweight_effective and feature_source_mode in ("normal", "fused") and irelief_info is not None:
-            reference_bits.append(f"irelief_dim={irelief_info['feature_dim']}")
-        if reference_bits:
-            st.caption(" | ".join(reference_bits))
-        if use_multilayer_irelief_normal and (positions_debiased or pca_subspace_debiased) and feature_source_mode in ("normal", "fused"):
-            st.caption("Multi-Layer-I-Relief auf Normalmap laeuft bewusst ohne Positionskorrektur.")
-        if use_irelief_patch_reweight and use_multilayer_irelief_normal and feature_source_mode in ("normal", "fused"):
-            st.caption("Das alte Layer-12-I-Relief-Reweight ist in diesem Modus ohne Wirkung.")
-        if use_top10pct_classifier_top32 and feature_source_mode in ("normal", "fused"):
-            st.caption("Der Top10%-Featuremodus nutzt weiterhin den Multilayer-Normalmap-Zweig, wendet I-Relief-Reweight an und schneidet danach auf die gespeicherten 32 Top10%-Klassifikator-Merkmale.")
-        if evaluate_top10pct_classifier:
-            st.caption("Die Query-Auswahl wird zusaetzlich durch den Top1-Patch-Endklassifikator geschickt. Bei einem einzelnen Query-Patch ist die Softmax-Gewichtung automatisch 1.0.")
-        if use_irelief_patch_reweight and feature_source_mode == "albedo":
-            st.caption("I-Relief ist im reinen Albedo-Modus ohne Wirkung.")
-        query_panel = _render_marked_patches(
-            query_assets["image_rgb"],
-            query_assets["grid_shape"],
-            st.session_state[query_state_key],
-        )
-        click_payload = streamlit_image_coordinates(
-            query_panel,
-            key=f"similarity_click_{query_sample}",
-            use_column_width="always",
-            cursor="crosshair",
-        )
-        if click_payload:
-            click_token = click_payload.get("unix_time")
-            last_click_key = f"last_similarity_click::{query_sample}"
-            if click_token != st.session_state.get(last_click_key):
-                patch_coords = _pixel_to_patch(query_panel.shape, query_assets["grid_shape"], click_payload)
-                if patch_coords is not None:
-                    selected = [tuple(item) for item in st.session_state.get(query_state_key, [])]
-                    if patch_coords in selected:
-                        selected = [item for item in selected if item != patch_coords]
-                    else:
-                        selected.append(patch_coords)
-                    st.session_state[query_state_key] = selected
-                st.session_state[last_click_key] = click_token
-                st.rerun()
-        clear_col, hint_col = st.columns([0.35, 0.65])
-        with clear_col:
-            if st.button("Clear Query", use_container_width=True):
-                st.session_state[query_state_key] = []
-                st.rerun()
-        with hint_col:
-            st.caption("Klick toggelt einen Query-Patch im linken Bild.")
-
-    query_patches = [tuple(item) for item in st.session_state.get(query_state_key, [])]
-    if not query_patches:
-        st.info("Setze links einen oder mehrere Query-Punkte, um die Similarity-Map zu berechnen.")
-        return
-
-    sim_grid_normal = None
-    sim_grid_albedo = None
-    query_anomaly_scores = None
-    query_weights = None
-    classifier_result = None
-
-    if feature_source_mode in ("normal", "fused"):
-        assert query_normal_features_for_similarity is not None and target_normal_features_for_similarity is not None
-        query_feature_normal, query_anomaly_scores, query_weights = _query_feature_from_selected(
-            query_normal_features_for_similarity,
-            query_assets["score_grid"],
-            query_assets["grid_shape"],
-            query_patches,
-        )
-        sim_grid_normal = _similarity_grid_from_query(
-            query_feature_normal,
-            target_normal_features_for_similarity,
-            target_assets["grid_shape"],
-        )
-
-    if feature_source_mode in ("albedo", "fused"):
-        assert query_albedo_features_for_similarity is not None and target_albedo_features_for_similarity is not None
-        query_feature_albedo, albedo_query_anomaly_scores, albedo_query_weights = _query_feature_from_selected(
-            query_albedo_features_for_similarity,
-            query_assets["score_grid"],
-            query_assets["grid_shape"],
-            query_patches,
-        )
-        if query_anomaly_scores is None:
-            query_anomaly_scores = albedo_query_anomaly_scores
-        if query_weights is None:
-            query_weights = albedo_query_weights
-        sim_grid_albedo = _similarity_grid_from_query(
-            query_feature_albedo,
-            target_albedo_features_for_similarity,
-            target_assets["grid_shape"],
-        )
-
-    if feature_source_mode == "normal":
-        assert sim_grid_normal is not None
-        sim_grid = sim_grid_normal.astype(np.float32)
-    elif feature_source_mode == "albedo":
-        assert sim_grid_albedo is not None
-        sim_grid = sim_grid_albedo.astype(np.float32)
-    else:
-        assert sim_grid_normal is not None and sim_grid_albedo is not None
-        sim_grid = (
-            fusion_alpha_normal * sim_grid_normal + fusion_alpha_albedo * sim_grid_albedo
-        ).astype(np.float32)
-
-    if evaluate_top10pct_classifier:
-        assert top10pct_classifier_model_info is not None
-        assert query_multilayer_assets is not None
-        classifier_query_feature, _, _ = _query_feature_from_selected(
-            query_multilayer_assets["features_norm"],
-            query_assets["score_grid"],
-            query_assets["grid_shape"],
-            query_patches,
-        )
-        classifier_query_feature = _apply_irelief_reweight(
-            classifier_query_feature[None, :],
-            np.asarray(top10pct_classifier_model_info["scale_sqrt"], dtype=np.float32),
-        )[0]
-        classifier_query_feature = _apply_feature_subset(
-            classifier_query_feature[None, :],
-            np.asarray(top10pct_classifier_model_info["selected_indices"], dtype=np.int32),
-            renormalize=False,
-        )
-        classifier_model = top10pct_classifier_model_info["model"]
-        classifier_proba = classifier_model.predict_proba(classifier_query_feature.astype(np.float32))[0].astype(np.float32)
-        classifier_pred_idx = int(classifier_model.predict(classifier_query_feature.astype(np.float32))[0])
-        classifier_pred_label = "3D" if classifier_pred_idx == 1 else "2D"
-        classifier_pred_confidence = float(classifier_proba[classifier_pred_idx])
-        classifier_result = {
-            "predicted_label": classifier_pred_label,
-            "predicted_confidence": classifier_pred_confidence,
-            "proba_2d": float(classifier_proba[0]),
-            "proba_3d": float(classifier_proba[1]),
-        }
-
-    assert query_anomaly_scores is not None and query_weights is not None
-    target_valid_mask = None
-    if anomalous_only_target:
-        target_valid_mask = target_assets["score_grid"] >= float(target_assets["image_threshold"])
-        if not bool(np.any(target_valid_mask)):
-            st.warning("Im Target-Bild liegen keine Patches ueber dem Bildthreshold.")
-            return
-    exclude_patches = query_patches if target_sample == query_sample else None
-    matches = _top_matches(
-        sim_grid,
-        top_k=top_k,
-        exclude_patches=exclude_patches,
-        valid_mask=target_valid_mask,
-    )
-    marked_matches = [(row, col) for row, col, _ in matches] if show_top_match_boxes else None
-    marked_target_patches = query_patches if target_sample == query_sample else None
-
-    with right:
-        st.subheader(f"Target Similarity: {target_sample}")
-        st.caption(
-            f"group={target_assets['evaluation_group']} | grid={target_assets['grid_shape'][0]}x{target_assets['grid_shape'][1]} | "
-            f"image_score={target_assets['image_score']:.5f} | threshold={target_assets['image_threshold']:.5f}"
-        )
-        target_caption = f"feature_source={feature_source_mode} | feature_mode={feature_mode_display}"
-        if feature_source_mode == "fused":
-            target_caption += f" | normal_w={fusion_alpha_normal:.2f} | albedo_w={fusion_alpha_albedo:.2f}"
-        st.caption(target_caption)
-        similarity_panel = _render_similarity_overlay(
-            target_assets["image_rgb"],
-            sim_grid,
-            marked_patches=marked_target_patches,
-            top_matches=marked_matches,
-            valid_mask_grid=target_valid_mask,
-        )
-        st.image(similarity_panel, caption="Cosine Similarity Overlay", use_container_width=True)
-        if target_sample == query_sample:
-            st.caption(
-                f"Query patches: {len(query_patches)} | "
-                f"target filter={'threshold' if anomalous_only_target else 'all'} | "
-                f"sim range=[{float(sim_grid.min()):.4f}, {float(sim_grid.max()):.4f}]"
-            )
-        elif matches:
-            best_row, best_col, best_sim = matches[0]
-            st.caption(
-                f"Query patches: {len(query_patches)} | "
-                f"target filter={'threshold' if anomalous_only_target else 'all'} | "
-                f"best target match: row={best_row}, col={best_col}, sim={best_sim:.4f} | "
-                f"sim range=[{float(sim_grid.min()):.4f}, {float(sim_grid.max()):.4f}]"
-            )
-
-    lower_left, lower_mid, lower_right = st.columns([0.9, 1.1, 1.1])
-
-    query_details: list[dict[str, Any]] = []
-    query_tiles: list[np.ndarray] = []
-    for index, ((row, col), anomaly_score, weight) in enumerate(zip(query_patches, query_anomaly_scores, query_weights), start=1):
-        query_details.append(
-            {
-                "rank": index,
-                "row": int(row),
-                "col": int(col),
-                "anomaly_score": float(anomaly_score),
-                "weight": float(weight),
-            }
-        )
-        crop = _patch_crop(query_assets["image_rgb"], query_assets["grid_shape"], row, col, pad=0)
-        query_tiles.append(
-            _make_titled_panel(
-                crop,
-                f"Q{index} r={row} c={col} a={anomaly_score:.3f} w={weight:.3f}",
-                target_height=140,
-            )
-        )
-    query_strip = _stack_row(query_tiles, pad=10, bg_color=18) if query_tiles else None
-
-    with lower_left:
-        st.subheader("Query Patches")
-        st.dataframe(query_details, use_container_width=True, hide_index=True)
-        if classifier_result is not None:
-            st.subheader("Top1-Patch Classifier")
-            pred_col, conf_col = st.columns(2)
-            with pred_col:
-                st.metric("Vorhersage", classifier_result["predicted_label"])
-            with conf_col:
-                st.metric(
-                    "Wahrscheinlichkeit der Vorhersage",
-                    f"{classifier_result['predicted_confidence']*100:.1f}%",
-                )
-            st.caption(
-                f"p(2D)={classifier_result['proba_2d']:.4f} | "
-                f"p(3D)={classifier_result['proba_3d']:.4f}"
-            )
-
-    anomaly_panel = None
-    with lower_mid:
-        if show_anomaly_overlay:
-            st.subheader("Target Anomaly Map")
-            anomaly_panel = _render_anomaly_overlay(
-                target_assets["image_rgb"],
-                target_assets["score_grid"],
-                marked_target_patches,
-            )
-            st.image(anomaly_panel, caption="AnomalyDINO Anomaly Overlay", use_container_width=True)
-
-    top_rows: list[dict[str, Any]] = []
-    with lower_right:
-        st.subheader("Top Matches in Target")
-        for rank, (row, col, similarity) in enumerate(matches, start=1):
-            row_info = {
-                "rank": rank,
-                "sample": target_sample,
-                "row": row,
-                "col": col,
-                "cosine_similarity": similarity,
-                "anomaly_score": float(target_assets["score_grid"][row, col]),
-            }
-            if sim_grid_normal is not None:
-                row_info["cosine_similarity_normal"] = float(sim_grid_normal[row, col])
-            if sim_grid_albedo is not None:
-                row_info["cosine_similarity_albedo"] = float(sim_grid_albedo[row, col])
-            top_rows.append(row_info)
-        st.dataframe(top_rows, use_container_width=True, hide_index=True)
-
-    if query_strip is not None:
-        st.subheader("Query Patch Crops")
-        st.image(query_strip, use_container_width=True)
-
-    match_strip = _build_match_strip(target_assets, matches, max_items=min(top_k, 6))
-    if matches:
-        st.subheader("Top Match Crops")
-        cols = st.columns(min(top_k, 6))
-        for idx, (row, col, similarity) in enumerate(matches[:6]):
-            with cols[idx]:
-                crop = _patch_crop(target_assets["image_rgb"], target_assets["grid_shape"], row, col, pad=0)
-                st.image(
-                    crop,
-                    caption=f"#{idx + 1} r={row} c={col}\ncos={similarity:.3f}",
-                    use_container_width=True,
-                )
-
-    export_col, info_col = st.columns([0.35, 0.65])
-    with export_col:
-        if st.button("Export Current View", use_container_width=True):
-            png_path, json_path = _export_current_view(
-                experiment_dir_str=experiment_dir_str,
-                seed=int(seed),
-                query_assets=query_assets,
-                target_assets=target_assets,
-                query_patches=query_patches,
-                query_details=query_details,
-                query_panel=query_panel,
-                similarity_panel=similarity_panel,
-                query_strip=query_strip,
-                target_anomaly_panel=anomaly_panel,
-                match_strip=match_strip,
-                top_rows=top_rows,
-                sim_grid=sim_grid,
-                target_filter_mode="threshold" if anomalous_only_target else "all",
-                feature_mode=feature_mode_display,
-                feature_source_mode=feature_source_mode,
-                fusion_alpha_normal=fusion_alpha_normal,
-                fusion_alpha_albedo=fusion_alpha_albedo,
-            )
-            st.session_state["similarity_last_export"] = {
-                "png": str(png_path),
-                "json": str(json_path),
-            }
-            st.success(f"Export geschrieben: {png_path.name}")
-    with info_col:
-        export_dir = Path(experiment_dir_str).resolve() / EXPORT_SUBDIR / f"seed={int(seed)}"
-        st.caption(f"Export-Ordner: {export_dir}")
-        last_export = st.session_state.get("similarity_last_export")
-        if last_export:
-            st.code(f"PNG : {last_export['png']}\nJSON: {last_export['json']}", language="text")
 
 
 if __name__ == "__main__":

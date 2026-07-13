@@ -3,21 +3,21 @@
 Dieses Repository enthaelt den im Rahmen der Masterarbeit erweiterten AnomalyDINO-Prototypen. Der relevante Einstiegspunkt fuer die entwickelte Anwendung ist:
 
 ```powershell
-python -m streamlit run .\anomalydino_similarity_app\app.py
+python -m streamlit run .\anomalydino_app\app.py
 ```
 
 Der GitHub-Stand enthaelt den Quellcode der App, die ROI-Extraktions- und Klassifikationslogik sowie die kleinen Modell- und Konfigurationsartefakte fuer die final verwendeten mRMR- und Boruta-Klassifikatoren. Grosse Datensaetze, Feature-Caches, Anomaly-Map-Arrays und Ergebnisbilder werden bewusst nicht versioniert und muessen bei Bedarf separat bereitgestellt werden.
 
 Wichtige Pfade:
 
-- `anomalydino_similarity_app/app.py`: Streamlit-App fuer Einstellungen, Bauteil-Test und Testdatensatz-Evaluierung.
+- `anomalydino_app/app.py`: Streamlit-App fuer Einstellungen, Bauteil-Test und Testdatensatz-Evaluierung.
 - `src/backbones.py`: Backbone-Laden inklusive DINOv3-Unterstuetzung.
 - `show_heatmap.py`: Funktionen der hysterese-basierten ROI-Extraktion.
 - `results_FINAL/normalmap_dinov3_vitb16_res688/final_all_boxes_overthreshold_maxminmean_mrmr_fixedk384_rbf`: gespeicherter mRMR-RBF-SVM-Klassifikator.
 - `results_FINAL/normalmap_dinov3_vitb16_res688/final_all_boxes_overthreshold_maxminmean_boruta_prefilter1000_relaxed_rbf`: gespeicherter Boruta-RBF-SVM-Klassifikator.
 - `results_FINAL/normalmap_dinov3_vitb16_res688/app_settings/anomaly_detection/normalmap/confirmed_threshold_config.json`: bestaetigte Normalmap-Anomaly-Detection-Konfiguration.
 
-Weitere Details zur App stehen in `anomalydino_similarity_app/README.md`.
+Weitere Details zur App stehen in `anomalydino_app/README.md`.
 
 ---
 

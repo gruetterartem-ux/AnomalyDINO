@@ -1,7 +1,7 @@
 # Model Building
 
 Dieser Ordner enthaelt die Skripte zur Erzeugung und Bewertung der finalen ROI-Klassifikatoren.
-Die App-Laufzeit liegt getrennt in `anomalydino_similarity_app`.
+Die App-Laufzeit liegt getrennt in `anomalydino_app`.
 
 ## Zentrale Workflows
 

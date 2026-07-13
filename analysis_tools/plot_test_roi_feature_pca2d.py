@@ -20,7 +20,7 @@ from PIL import Image
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from anomalydino_similarity_app import app as app_mod
+from anomalydino_app import app as app_mod
 from extract_labeled_roi_overthreshold_multilayer_maxminmean_features import (
     aggregate_maxminmean_per_layer,
 )
@@ -243,6 +243,8 @@ def plot_model_pca(
     feature_lookup: dict[tuple[str, str], np.ndarray],
     classifier_info: dict[str, Any],
     output_dir: Path,
+    dataset_name: str = "Test-ROIs",
+    file_prefix: str | None = None,
 ) -> dict[str, Any]:
     selected_indices = np.asarray(classifier_info["selected_indices"], dtype=np.int32)
     rows: list[dict[str, Any]] = []
@@ -283,8 +285,9 @@ def plot_model_pca(
     result_table["pca2"] = coords[:, 1]
 
     ensure_dir(output_dir)
-    output_png = output_dir / f"{model_name.lower()}_test_roi_pca2d.png"
-    output_csv = output_dir / f"{model_name.lower()}_test_roi_pca2d_scores.csv"
+    output_stem = file_prefix or f"{model_name.lower()}_test_roi_pca2d"
+    output_png = output_dir / f"{output_stem}.png"
+    output_csv = output_dir / f"{output_stem}_scores.csv"
 
     fig, ax = plt.subplots(figsize=(8.5, 7), dpi=180)
     colors = {"2D": "#2E7D32", "3D": "#C62828"}
@@ -312,7 +315,7 @@ def plot_model_pca(
             label="falsch klassifiziert",
         )
 
-    ax.set_title(f"PCA 2D Scatterplot Test-ROIs ({model_name})")
+    ax.set_title(f"PCA 2D Scatterplot {dataset_name} ({model_name})")
     ax.set_xlabel("PCA-Komponente 1")
     ax.set_ylabel("PCA-Komponente 2")
     ax.grid(alpha=0.18)
@@ -324,6 +327,7 @@ def plot_model_pca(
     result_table.to_csv(output_csv, index=False)
     summary = {
         "model": model_name,
+        "dataset": dataset_name,
         "num_rois": int(len(result_table)),
         "selected_feature_count": int(selected_indices.size),
         "class_counts": result_table["true_roi_label"].value_counts().to_dict(),
@@ -335,7 +339,8 @@ def plot_model_pca(
             "scores_csv": str(output_csv),
         },
     }
-    (output_dir / f"{model_name.lower()}_summary.json").write_text(
+    summary_name = f"{file_prefix}_summary.json" if file_prefix else f"{model_name.lower()}_summary.json"
+    (output_dir / summary_name).write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )

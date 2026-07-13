@@ -1,0 +1,43 @@
+AnomalyDINO App auf einem neuen Windows-Laptop starten
+=======================================================
+
+1. Repository klonen
+--------------------
+In der Eingabeaufforderung oder PowerShell:
+
+cd C:\
+git clone https://github.com/gruetterartem-ux/AnomalyDINO.git
+cd C:\AnomalyDINO
+
+
+2. Python-Umgebung erstellen
+----------------------------
+Empfohlen: Python 3.10.
+
+python -m venv .venvAnomalyDINO
+.\.venvAnomalyDINO\Scripts\activate
+python -m pip install --upgrade pip
+
+
+3. Pakete installieren
+----------------------
+pip install -r requirements.txt
+
+Falls faiss-gpu nicht installiert werden kann:
+
+pip install faiss-cpu
+
+
+4. App starten
+--------------
+.\.venvAnomalyDINO\Scripts\python.exe -m streamlit run .\anomalydino_app\app.py
+
+
+5. Hinweise
+-----------
+- Beim ersten Start wird DINOv3 von Hugging Face geladen:
+  facebook/dinov3-vitb16-pretrain-lvd1689m
+- Dafuer wird Internetzugriff benoetigt.
+- Die noetigen Referenzbilder, Threshold-Einstellungen und ROI-Klassifikatoren sind im Repository enthalten.
+- Fuer neue Bauteilbilder werden die grossen Feature-Caches nicht benoetigt.
+- In der App: Bauteil-Test -> Externe Uploads waehlen, Bilder hochladen und Test starten.
