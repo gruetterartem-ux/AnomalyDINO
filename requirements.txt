@@ -12,6 +12,7 @@ tifffile
 argparse
 PyYAML
 pandas
+openpyxl
 streamlit
 streamlit-image-coordinates
 transformers
